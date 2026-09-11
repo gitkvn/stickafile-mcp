@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+.DS_Store
+# Claude Code: ignore local state, but track the shared hook config so the
+# branch guard survives a fresh clone (same convention as the stickr repo).
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+# local test scratch (test/e2e.js)
+test/.tmp/

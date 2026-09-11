@@ -1,0 +1,19 @@
+{
+  "name": "stickafile-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that uploads a file from disk to a Stickafile portal and returns a shareable link. The bytes never enter the model's context.",
+  "type": "module",
+  "bin": { "stickafile-mcp": "src/index.js" },
+  "files": ["src", "README.md"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/e2e.js"
+  },
+  "keywords": ["mcp", "stickafile", "upload", "model-context-protocol"],
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.2"
+  }
+}
