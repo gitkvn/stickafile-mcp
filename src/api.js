@@ -24,7 +24,7 @@ export function describePortal(p) {
 }
 
 // Portal tokens are exactly 8 chars. A name is guessable ("test"); a token
-// ("33820d15") is not, so requiring the push argument to be a token means the
+// ("a1b2c3d4") is not, so requiring the push argument to be a token means the
 // model must have called list_portals to learn it rather than inventing one.
 var TOKEN_RE = /^[a-z0-9]{8}$/i;
 

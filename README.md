@@ -47,7 +47,7 @@ Equivalent `.mcp.json` entry:
 ## Choosing a portal
 
 The `push` tool's `portal` argument is an **8-character portal token only**
-(e.g. `33820d15`), never a portal name. Get it from `list_portals`. A name is
+(e.g. `a1b2c3d4`), never a portal name. Get it from `list_portals`. A name is
 passed straight through and refused with a message pointing back at
 `list_portals`. This is deliberate: a name like `test` is guessable, so an
 agent can fabricate a plausible one; a token is not, so the agent has to have
