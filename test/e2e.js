@@ -82,6 +82,7 @@ const sha = buf => crypto.createHash('sha256').update(buf).digest('hex');
   fs.writeFileSync(path.join(WS, '.git', 'config'), 'x');
   fs.writeFileSync(path.join(WS, '.env'), 'SECRET=1');
   fs.writeFileSync(path.join(WS, 'server.pem'), 'x');
+  fs.writeFileSync(path.join(WS, 'id_rsa'), 'x'); // credential-shaped name INSIDE the allowed root
   fs.writeFileSync(path.join(WS, 'empty.txt'), '');
   fs.writeFileSync(path.join(OUTSIDE, 'id_rsa'), 'x');
   fs.writeFileSync(path.join(OUTSIDE, 'plain.txt'), 'outside');
@@ -122,6 +123,7 @@ const sha = buf => crypto.createHash('sha256').update(buf).digest('hex');
   await refused('dot-directory refused', path.join(WS, '.git', 'config'), 'dot-directory');
   await refused('dotfile refused', path.join(WS, '.env'), 'dotfile');
   await refused('credential-shaped name refused', path.join(WS, 'server.pem'), 'credential');
+  await refused('credential name refused INSIDE the allowed root (not just outside)', path.join(WS, 'id_rsa'), 'credential');
   await refused('directory refused', WS, 'not a regular file');
   await refused('empty file refused', path.join(WS, 'empty.txt'), 'empty');
   await refused('missing file', path.join(WS, 'nope.bin'), 'file not found');
@@ -142,23 +144,54 @@ const sha = buf => crypto.createHash('sha256').update(buf).digest('hex');
 
   console.log('PORTAL DEFAULTING');
   db.prepare("INSERT INTO portals (token, owner_email, name, status, shared_view) VALUES ('secondpt', 'mcp@harness.test', 'Client Drop', 'active', 1)").run();
+  const lastPortal = () => db.prepare("SELECT portal_token FROM big_files WHERE filename = 'report.bin' ORDER BY rowid DESC").get().portal_token;
   const amb = await call('push', { path: path.join(WS, 'report.bin') });
-  check('two active portals, none given → error listing both', amb.isError && text(amb).includes('2 active portals') && text(amb).includes('agent pushes') && text(amb).includes('Client Drop'), text(amb));
+  check('two active portals, none given → error listing name, token and mode of each',
+    amb.isError && text(amb).includes('2 active portals')
+    && text(amb).includes('agent pushes') && text(amb).includes('agentpsh') && text(amb).includes('inbox')
+    && text(amb).includes('Client Drop') && text(amb).includes('secondpt') && text(amb).includes('shared'),
+    text(amb));
+  // The argument is token-only now. A name must be refused, and nothing pushed.
+  const before = lastPortal();
   const byName = await call('push', { path: path.join(WS, 'report.bin'), portal: 'client drop' });
-  check('portal by name (case-insensitive) → pushed to it', !byName.isError && db.prepare("SELECT portal_token FROM big_files WHERE filename = 'report.bin' ORDER BY rowid DESC").get().portal_token === 'secondpt', text(byName));
-  const byTok = await call('push', { path: path.join(WS, 'report.bin'), portal: 'agentpsh' });
-  check('portal by token → pushed to it', !byTok.isError && db.prepare("SELECT portal_token FROM big_files WHERE filename = 'report.bin' ORDER BY rowid DESC").get().portal_token === 'agentpsh', text(byTok));
-  const nf = await call('push', { path: path.join(WS, 'report.bin'), portal: 'nope' });
-  check('unknown portal → error naming the choices', nf.isError && text(nf).includes('not found') && text(nf).includes('agent pushes'), text(nf));
+  check('portal argument by NAME → refused, points at list_portals, never pushes',
+    byName.isError && text(byName).includes('8-character portal token') && text(byName).includes('list_portals') && lastPortal() === before,
+    text(byName));
+  const byTok = await call('push', { path: path.join(WS, 'report.bin'), portal: 'secondpt' });
+  check('portal argument by TOKEN → pushed to it', !byTok.isError && lastPortal() === 'secondpt', text(byTok));
+  const badShape = await call('push', { path: path.join(WS, 'report.bin'), portal: 'nope' });
+  check('non-token argument ("nope") → refused as not-a-token', badShape.isError && text(badShape).includes('8-character portal token'), text(badShape));
+  const unknownTok = await call('push', { path: path.join(WS, 'report.bin'), portal: 'zzzzzzzz' });
+  check('well-formed but unknown token → error naming the choices', unknownTok.isError && text(unknownTok).includes('no portal has the token') && text(unknownTok).includes('agent pushes'), text(unknownTok));
   db.prepare("UPDATE portals SET status = 'deactivated' WHERE token = 'secondpt'").run();
-  const deact = await call('push', { path: path.join(WS, 'report.bin'), portal: 'Client Drop' });
-  check('deactivated portal named explicitly → error', deact.isError && text(deact).includes('deactivated'), text(deact));
+  const deact = await call('push', { path: path.join(WS, 'report.bin'), portal: 'secondpt' });
+  check('deactivated portal by token → error', deact.isError && text(deact).includes('deactivated'), text(deact));
   const single = await call('push', { path: path.join(WS, 'report.bin') });
   check('one active again → defaults without arg', !single.isError, text(single));
   db.prepare("UPDATE portals SET status = 'deactivated' WHERE token = 'agentpsh'").run();
   const none = await call('push', { path: path.join(WS, 'report.bin') });
   check('zero active → error pointing at browser creation', none.isError && text(none).includes('/portal/new'), text(none));
   db.prepare("UPDATE portals SET status = 'active' WHERE token = 'agentpsh'").run();
+
+  console.log('STICKAFILE_PORTAL (env default still accepts a name)');
+  db.prepare("UPDATE portals SET status = 'active' WHERE token = 'secondpt'").run(); // two active, so the default actually selects
+  {
+    const t2 = new StdioClientTransport({
+      command: process.execPath,
+      args: [path.join(ROOT, 'src', 'index.js')],
+      cwd: WS,
+      env: { ...process.env, STICKAFILE_TOKEN: secret, STICKAFILE_URL: APP, STICKAFILE_PORTAL: 'Client Drop' },
+      stderr: 'pipe',
+    });
+    const mcp2 = new Client({ name: 'e2e-env', version: '0' });
+    await mcp2.connect(t2);
+    const envPush = await mcp2.callTool({ name: 'push', arguments: { path: path.join(WS, 'report.bin') } });
+    check('STICKAFILE_PORTAL set to a NAME → no-arg push resolves it (name still allowed in env)',
+      !envPush.isError && lastPortal() === 'secondpt',
+      (envPush.content || []).map(c => c.text || '').join('\n'));
+    await mcp2.close().catch(() => {});
+  }
+  db.prepare("UPDATE portals SET status = 'deactivated' WHERE token = 'secondpt'").run(); // restore: only agentpsh active
 
   console.log('BAD TOKEN');
   db.prepare("UPDATE api_tokens SET revoked_at = datetime('now') WHERE id = 'tok-mcp'").run();

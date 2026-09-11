@@ -8,7 +8,9 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node test/e2e.js"
+    "test": "node --test test/safety.test.js && node test/e2e.js",
+    "test:unit": "node --test test/safety.test.js",
+    "test:e2e": "node test/e2e.js"
   },
   "keywords": ["mcp", "stickafile", "upload", "model-context-protocol"],
   "license": "ISC",

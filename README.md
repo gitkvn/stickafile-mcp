@@ -6,7 +6,7 @@ The bytes go from disk to storage; they never enter the model's context.
 
 Two tools:
 
-- `push(path, portal?)` → `{ url, name, size }`
+- `push(path, portal?)` → `{ url, name, size }` — `portal` is an 8-character portal token
 - `list_portals()` → the portals the token owns
 
 ## Install
@@ -44,10 +44,25 @@ Equivalent `.mcp.json` entry:
 | `STICKAFILE_PORTAL` | no | Default portal (name or token) when `push` is called without one. |
 | `STICKAFILE_ALLOW` | no | Path-delimited directories `push` may read from. Default: the directory the server was started in, which Claude Code sets to the project. |
 
-## Portal defaulting
+## Choosing a portal
 
-When `portal` is omitted: `STICKAFILE_PORTAL` if set, otherwise the single
-active portal if there is exactly one, otherwise an error listing the choices.
+The `push` tool's `portal` argument is an **8-character portal token only**
+(e.g. `33820d15`), never a portal name. Get it from `list_portals`. A name is
+passed straight through and refused with a message pointing back at
+`list_portals`. This is deliberate: a name like `test` is guessable, so an
+agent can fabricate a plausible one; a token is not, so the agent has to have
+called `list_portals` and is relaying real data rather than guessing. A push
+to the wrong *shared* portal exposes the file to everyone holding that
+portal's link, so the argument is built to make that hard to do by accident.
+
+When `portal` is omitted the precedence is:
+
+1. `STICKAFILE_PORTAL` if set — **this accepts a name or a token**, because a
+   human sets it once at install time, where a friendly name is reasonable.
+2. otherwise the single active portal, if there is exactly one;
+3. otherwise an error listing every active portal with its name, token, and
+   mode (shared or inbox), for the user to choose from.
+
 The server never picks silently among several portals. Portals are created in
 the browser only; tokens cannot create them.
 
@@ -68,8 +83,12 @@ controls do not depend on the model:
 
 ## No resume
 
-A failed upload restarts from the beginning. The server-side session is
-swept automatically. For a large file, a retry re-sends everything.
+A failed upload restarts from the beginning; the server-side session is swept
+automatically. There is no resume, so a retry re-sends the whole file. Because
+that is expensive and silent on a large file, `push` does not want the agent
+retrying on its own: a failure returns an error that says, in as many words,
+not to retry automatically and to ask the user first. Retrying is the user's
+call, not the model's.
 
 ## Development
 
@@ -78,5 +97,12 @@ stickr repo. Retry, chunking, and presign-continuation logic must stay in
 step between the two; see the header comment in each.
 
 ```
-STICKR_REPO=../stickr npm test   # boots the stickr server + mock S3 locally
+npm run test:unit                # path/deny-list unit tests; no stickr checkout needed
+STICKR_REPO=../stickr npm test   # unit tests, then the full e2e (boots stickr + mock S3)
 ```
+
+`npm run test:unit` (`test/safety.test.js`) exercises the path controls in
+`src/safety.js` directly — no server, no network, no model. It is the proof
+that the credential deny list (`id_rsa`, `*.pem`, `.env`, dot-directories, ...)
+fires on its own, which is what has to hold against a prompt injection: any
+refusal the model volunteers is worthless against the same injection.

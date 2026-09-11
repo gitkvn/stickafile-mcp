@@ -69,14 +69,16 @@ server.registerTool('push', {
     + 'The bytes are read from disk and uploaded directly; they never enter the conversation. '
     + '`path` must be an absolute path to a regular file inside the workspace. '
     + 'Dotfiles and credential-like files (.env, keys, certificates) are refused. '
-    + '`portal` is optional when the account has one portal; pass a portal name or token otherwise. '
+    + '`portal` is an 8-character portal token, obtained from list_portals; never invent one. '
+    + 'It is optional when the account has exactly one active portal. If it is omitted and the account has several portals, '
+    + 'the tool returns the list of portals (name, token, and whether each is shared) for the user to choose from — relay that and ask; do not pick one yourself. '
     + 'Tell the user which file you are uploading before calling this. '
     + 'Uploads take roughly a minute per gigabyte; call once per file and wait for the result. '
-    + 'A failed upload restarts from the beginning (no resume), so before retrying a large file tell the user it will re-send everything. '
+    + 'Do NOT retry a failed push automatically: there is no resume, so a retry re-sends the entire file from the start. Stop and ask the user whether to retry. '
     + 'Returns { url, name, size }.',
   inputSchema: {
     path: z.string().describe('Absolute path to the file to upload'),
-    portal: z.string().optional().describe('Portal name or 8-character token. Optional when the account has exactly one active portal.'),
+    portal: z.string().optional().describe('The 8-character portal token to push to, from list_portals. Not a portal name. Optional when the account has exactly one active portal; if omitted with several, the tool returns the list to choose from.'),
   },
   outputSchema: {
     url: z.string(),
@@ -121,10 +123,10 @@ server.registerTool('push', {
     log('done ' + result.url);
     return ok(result, 'Uploaded ' + result.name + ' (' + human(result.size) + ') to portal "' + portal.name + '".\nLink: ' + result.url);
   } catch (e) {
-    if (e instanceof UploadError) { log('push failed: ' + e.message); return fail('upload of ' + file.name + ' failed: ' + e.message + '. There is no resume; a retry re-sends the whole file.'); }
+    if (e instanceof UploadError) { log('push failed: ' + e.message); return fail('Upload of ' + file.name + ' (' + human(file.size) + ') failed after sending part of the file: ' + e.message + '. DO NOT retry automatically. There is no resume, so a retry re-sends the entire ' + human(file.size) + ' from the start. Ask the user whether to retry before calling push again.'); }
     if (e.message === 'cancelled') { log('push cancelled'); return fail('push cancelled; nothing was published'); }
     log('push error: ' + (e.stack || e.message));
-    return fail('upload of ' + file.name + ' failed: ' + e.message + '. There is no resume; a retry re-sends the whole file.');
+    return fail('Upload of ' + file.name + ' (' + human(file.size) + ') failed after sending part of the file: ' + e.message + '. DO NOT retry automatically. There is no resume, so a retry re-sends the entire ' + human(file.size) + ' from the start. Ask the user whether to retry before calling push again.');
   }
 });
 
