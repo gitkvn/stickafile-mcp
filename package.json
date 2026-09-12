@@ -13,7 +13,11 @@
     "test:e2e": "node test/e2e.js"
   },
   "keywords": ["mcp", "stickafile", "upload", "model-context-protocol"],
-  "license": "ISC",
+  "author": "Kavan Ravi <kvnrvi@gmail.com>",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/gitkvn/stickafile-mcp.git" },
+  "homepage": "https://stickafile.com",
+  "bugs": { "url": "https://github.com/gitkvn/stickafile-mcp/issues" },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^4.6.2"
