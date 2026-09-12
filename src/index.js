@@ -16,7 +16,7 @@ import { z } from 'zod';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { uploadFile, UploadError } from './upload.js';
-import { listPortals, choosePortal, describePortal, ApiError } from './api.js';
+import { listPortals, choosePortal, describePortal, verifyToken, ApiError } from './api.js';
 import { resolveRoots, vetPath, PathRefused } from './safety.js';
 
 const { version } = createRequire(import.meta.url)('../package.json');
@@ -35,6 +35,20 @@ if (!token.startsWith('sf_')) {
 const baseUrl = (process.env.STICKAFILE_URL || 'https://stickafile.com').trim().replace(/\/+$/, '');
 const client = { baseUrl, token };
 const roots = await resolveRoots(process.env);
+
+// Probe the token once before accepting connections, so a revoked token is
+// reported here, in the MCP client's server log, instead of on the first
+// push. Only a 401/403 stops startup; a timeout, DNS or connection failure,
+// or a server error starts the server anyway and the first call surfaces it.
+const STARTUP_CHECK_MS = 3000;
+{
+  const check = await verifyToken(client, { timeoutMs: STARTUP_CHECK_MS });
+  if (check.ok === false) {
+    log('Stickafile rejected STICKAFILE_TOKEN (' + check.detail + '). The token may be revoked or expired, or STICKAFILE_URL (' + baseUrl + ') may point at a server this token was not created on. Create a new token at ' + baseUrl + '/links (settings → api tokens) and update the MCP server config.');
+    process.exit(1);
+  }
+  if (check.ok === null) log('could not verify STICKAFILE_TOKEN at startup (' + check.detail + ' from ' + baseUrl + '); starting anyway. If the token is bad, the first call will say so.');
+}
 
 const MIME = {
   pdf: 'application/pdf', zip: 'application/zip', gz: 'application/gzip', tgz: 'application/gzip', tar: 'application/x-tar',

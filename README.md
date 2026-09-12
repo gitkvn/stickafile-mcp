@@ -24,6 +24,11 @@ Two tools:
 
    > push dist/report.pdf and give me the link
 
+The server checks the token once at startup. A revoked, expired, or
+wrong-server token makes it exit with a message in the client's MCP log
+instead of failing on the first push. A network failure at startup does not
+block it; the first call reports the problem instead.
+
 Any MCP client works; the equivalent `.mcp.json` entry is:
 
 ```json

@@ -19,6 +19,47 @@ export async function listPortals(client) {
   return data.portals || [];
 }
 
+// One probe of the token at startup, so a dead token fails at install time
+// rather than on the first push. Resolves to one of:
+//   { ok: true }
+//   { ok: false, status, detail }   — the server answered 401 or 403: the
+//                                     token itself is rejected. Startup stops.
+//   { ok: null, detail }            — anything else: no route, DNS failure,
+//                                     connection refused, timeout, 5xx, 429,
+//                                     an unexpected 4xx. The token may be
+//                                     fine; the first real call will tell.
+// The split is deliberate: only an explicit auth status from the server is
+// evidence about the token. Every other failure is evidence about the
+// network or the server, and a server that starts anyway costs nothing,
+// whereas one that refuses to start on a blip reports as failed in the MCP
+// client for an unrelated reason. The probe is one plain request, not
+// apiFetch: a 429 here must not enter the backoff loop, and the in-flight
+// request is aborted at the deadline.
+export async function verifyToken(client, opts) {
+  var timeoutMs = (opts && opts.timeoutMs) || 3000;
+  var res;
+  try {
+    res = await fetch(client.baseUrl + '/api/portal/list', {
+      headers: { Authorization: 'Bearer ' + client.token },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    var name = e && e.name;
+    var code = e && e.cause && e.cause.code;
+    var detail = name === 'TimeoutError' || name === 'AbortError'
+      ? 'no response within ' + timeoutMs + ' ms'
+      : (code ? code + ' ' : '') + ((e && e.message) || 'network error');
+    return { ok: null, detail: detail };
+  }
+  if (!res) return { ok: null, detail: 'no response within ' + timeoutMs + ' ms' };
+  if (res.status === 401 || res.status === 403) {
+    var body = await res.json().catch(function () { return {}; });
+    return { ok: false, status: res.status, detail: body.error || ('HTTP ' + res.status) };
+  }
+  if (res.ok) return { ok: true };
+  return { ok: null, detail: 'HTTP ' + res.status };
+}
+
 export function describePortal(p) {
   return { token: p.token, name: p.name, mode: p.sharedView ? 'shared' : 'inbox', status: p.status, fileCount: p.fileCount, url: p.url };
 }
