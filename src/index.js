@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // stickafile-mcp — a local stdio MCP server with two tools:
-//   push(path, portal?) → { url, name, size }
-//   list_portals()      → portals the token owns
+//   push(path, portal?, note?) → { url, name, size }
+//   list_portals()             → portals the token owns
+// A push with no portal makes a portal-less link (a quick send); a portal
+// token puts the file in that portal.
 // The file's bytes go from disk to R2 and never enter the model's context.
 //
 // Config (environment):
 //   STICKAFILE_TOKEN   required; an sf_ API token from stickafile.com settings
 //   STICKAFILE_URL     base URL, default https://stickafile.com
-//   STICKAFILE_PORTAL  optional default portal (name or token)
+//   STICKAFILE_PORTAL  optional default portal (name or token); when set, a
+//                      push without a portal goes there instead of to a link
 //   STICKAFILE_ALLOW   optional path-delimited list of directories push may
 //                      read from; default: the directory the server started in
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -83,22 +86,24 @@ function ok(structured, text) {
 server.registerTool('push', {
   title: 'Push a file to Stickafile',
   description:
-    'Upload a file from disk to a Stickafile portal and return a shareable download link. '
+    'Upload a file from disk to Stickafile and return a shareable download link. '
     + 'Use this when the user wants to send, share, or hand off a file (a build, an export, a report, an archive, a video, a dataset) '
     + 'to a person or another machine, or asks for "a link" to a file. '
     + 'The bytes are read from disk and uploaded directly; they never enter the conversation. '
+    + 'By default the file becomes a standalone link owned by the account; this is the normal case and needs no other arguments. '
+    + 'Pass `portal` only when the user wants the file in a particular portal (a project\'s shared or inbox space): '
+    + 'it is an 8-character portal token obtained from list_portals, never a name and never invented. '
+    + '`note` is optional plain text shown on the download page (what the file is, who it is for). '
     + '`path` must be an absolute path to a regular file inside the workspace. '
     + 'Dotfiles and credential-like files (.env, keys, certificates) are refused. '
-    + '`portal` is an 8-character portal token, obtained from list_portals; never invent one. '
-    + 'It is optional when the account has exactly one active portal. If it is omitted and the account has several portals, '
-    + 'the tool returns the list of portals (name, token, and whether each is shared) for the user to choose from — relay that and ask; do not pick one yourself. '
     + 'Tell the user which file you are uploading before calling this. '
     + 'Uploads take roughly a minute per gigabyte; call once per file and wait for the result. '
     + 'Do NOT retry a failed push automatically: there is no resume, so a retry re-sends the entire file from the start. Stop and ask the user whether to retry. '
     + 'Returns { url, name, size }.',
   inputSchema: {
     path: z.string().describe('Absolute path to the file to upload'),
-    portal: z.string().optional().describe('The 8-character portal token to push to, from list_portals. Not a portal name. Optional when the account has exactly one active portal; if omitted with several, the tool returns the list to choose from.'),
+    portal: z.string().optional().describe('Optional. The 8-character portal token to push to, from list_portals; not a portal name. Omit it to create a standalone link, which is the default.'),
+    note: z.string().max(500).optional().describe('Optional plain-text note shown on the download page, up to 500 characters.'),
   },
   outputSchema: {
     url: z.string(),
@@ -106,7 +111,7 @@ server.registerTool('push', {
     size: z.number(),
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-}, async ({ path: input, portal: portalArg }, extra) => {
+}, async ({ path: input, portal: portalArg, note: noteArg }, extra) => {
   let file;
   try { file = await vetPath(input, roots); }
   catch (e) {
@@ -116,6 +121,7 @@ server.registerTool('push', {
 
   // From here on the vetted descriptor (file.fh) is open; close it on every path.
   try {
+    // A portal entry, or null for a portal-less link.
     let portal;
     try { portal = await choosePortal(client, portalArg, process.env); }
     catch (e) {
@@ -123,8 +129,10 @@ server.registerTool('push', {
       if (e.message === 'cancelled') return fail('push cancelled');
       return fail('could not reach ' + baseUrl + ': ' + e.message);
     }
+    const note = (noteArg || '').trim() || undefined;
+    const target = portal ? 'portal "' + portal.name + '"' : 'link';
 
-    log('push ' + file.path + ' (' + human(file.size) + ') → portal "' + portal.name + '" (' + portal.token + ')');
+    log('push ' + file.path + ' (' + human(file.size) + ') → ' + (portal ? target + ' (' + portal.token + ')' : target) + (note ? ' with note' : ''));
 
     const progressToken = extra._meta && extra._meta.progressToken;
     let lastPct = -1;
@@ -133,23 +141,23 @@ server.registerTool('push', {
       lastPct = pct;
       extra.sendNotification({
         method: 'notifications/progress',
-        params: { progressToken, progress: sent, total, message: pct + '% · ' + human(sent) + ' of ' + human(total) + ' → ' + portal.name },
+        params: { progressToken, progress: sent, total, message: pct + '% · ' + human(sent) + ' of ' + human(total) + ' → ' + (portal ? portal.name : 'link') },
       }).catch(() => {});
     };
 
     try {
       const result = await uploadFile({
         client, fh: file.fh, filePath: file.path, name: file.name, size: file.size, mimeType: mimeFor(file.name),
-        portalToken: portal.token, onProgress, signal: extra.signal,
+        portalToken: portal ? portal.token : undefined, note, onProgress, signal: extra.signal,
       });
       if (result.url) {
         log('done ' + result.url);
-        return ok(result, 'Uploaded ' + result.name + ' (' + human(result.size) + ') to portal "' + portal.name + '".\nLink: ' + result.url);
+        return ok(result, 'Uploaded ' + result.name + ' (' + human(result.size) + ')' + (portal ? ' to ' + target : '') + '.\nLink: ' + result.url);
       }
       // Upload finalized, but the server returned no readable link. Report
       // success plainly; never claim failure for a file that is now public.
       log('done (upload finalized; no link returned by the server)');
-      return ok({ ...result, url: '' }, 'Uploaded ' + result.name + ' (' + human(result.size) + ') to portal "' + portal.name + '". The upload succeeded, but the server did not return a readable download link — find it at ' + baseUrl + '/links.');
+      return ok({ ...result, url: '' }, 'Uploaded ' + result.name + ' (' + human(result.size) + ')' + (portal ? ' to ' + target : '') + '. The upload succeeded, but the server did not return a readable download link — find it at ' + baseUrl + '/links.');
     } catch (e) {
       if (e instanceof UploadError) { log('push failed: ' + e.message); return fail('Upload of ' + file.name + ' (' + human(file.size) + ') failed after sending part of the file: ' + e.message + '. DO NOT retry automatically. There is no resume, so a retry re-sends the entire ' + human(file.size) + ' from the start. Ask the user whether to retry before calling push again.'); }
       if (e.message === 'cancelled') { log('push cancelled'); return fail('push cancelled; nothing was published'); }
@@ -165,8 +173,8 @@ server.registerTool('list_portals', {
   title: 'List Stickafile portals',
   description:
     'List the Stickafile portals this account can push to, with each portal\'s name, token, mode (shared or inbox), status, and file count. '
-    + 'Call this when push reports that a portal must be chosen, or when the user asks what portals exist. '
-    + 'Not needed before an ordinary push.',
+    + 'Call this when the user wants a file pushed into a particular portal (to get its token for push), or asks what portals exist. '
+    + 'Not needed before an ordinary push, which creates a standalone link.',
   inputSchema: {},
   outputSchema: {
     portals: z.array(z.object({

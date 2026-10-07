@@ -86,13 +86,25 @@ async function uploadToR2(presignedUrl, buf) {
 //   filePath    — absolute path (already vetted; used only in messages)
 //   name, size  — basename and byte length
 //   mimeType
-//   portalToken — 8-char portal token
+//   portalToken — optional 8-char portal token; omitted, the file becomes a
+//                 portal-less link owned by the token's user (a quick send)
+//   note        — optional plain text shown on the download page (the
+//                 server trims it to 500 characters)
 //   onProgress  — optional function({ sent, total, pct })
 //   signal      — optional AbortSignal; checked between chunks and before
 //                 each API call. A cancelled upload stops cleanly and never
 //                 finalizes.
 // Resolves { url, name, size }; throws UploadError with a user-facing
 // message (the same strings the browser shows), or a plain Error on abort.
+// The init request body. `portalToken` and `note` are present only when
+// given; the server reads a missing portalToken as a quick send.
+export function initBody(opts) {
+  var body = { files: [{ filename: opts.name, fileSize: opts.size, mimeType: opts.mimeType }] };
+  if (opts.portalToken) body.portalToken = opts.portalToken;
+  if (opts.note) body.note = opts.note;
+  return body;
+}
+
 export async function uploadFile(opts) {
   var client = opts.client;
   var onProgress = opts.onProgress || function () {};
@@ -102,10 +114,7 @@ export async function uploadFile(opts) {
   var initRes = await apiFetch(client, '/api/big/init', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      files: [{ filename: opts.name, fileSize: opts.size, mimeType: opts.mimeType }],
-      portalToken: opts.portalToken,
-    }),
+    body: JSON.stringify(initBody(opts)),
   }, isCancelled);
   if (!initRes) throw new Error('cancelled');
   if (!initRes.ok) {

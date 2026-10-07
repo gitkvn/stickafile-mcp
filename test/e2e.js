@@ -1,8 +1,9 @@
 // End-to-end: boots the stickr server + mock S3 from a sibling checkout
 // (STICKR_REPO, default ../stickr), seeds a user, a token and a portal into
 // the scratch DB, then launches src/index.js over stdio through the MCP
-// client SDK and exercises both tools: the path vetting, portal defaulting,
-// a 3-chunk push, and a 505 MiB push that crosses the 100-URL presign window
+// client SDK and exercises both tools: the path vetting, where a push goes
+// (a link by default, a portal by token or STICKAFILE_PORTAL), the note, a
+// 3-chunk push, and a 505 MiB push that crosses the 100-URL presign window
 // (the riskiest part of the port). Downloads are hashed against the source.
 //
 //   npm test
@@ -65,11 +66,11 @@ const sha = buf => crypto.createHash('sha256').update(buf).digest('hex');
   });
   await waitFor(APP + '/');
 
-  // ── seed: user, token, one active portal ──
+  // ── seed: user, token (all three scopes, as the server mints them), one active portal ──
   const db = createRequire(path.join(STICKR, 'package.json'))('better-sqlite3')(path.join(TMP, 'stickr.db'));
   db.prepare("INSERT INTO users (id, google_id, email, name) VALUES ('u-mcp', 'g-mcp', 'mcp@harness.test', 'MCP User')").run();
   const secret = 'sf_' + crypto.randomBytes(32).toString('base64url');
-  db.prepare("INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scopes) VALUES ('tok-mcp', 'u-mcp', 'e2e', ?, ?, 'portals:read portals:push')").run(sha(secret), secret.slice(0, 11));
+  db.prepare("INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scopes) VALUES ('tok-mcp', 'u-mcp', 'e2e', ?, ?, 'portals:read portals:push links:push')").run(sha(secret), secret.slice(0, 11));
   // Portal tokens are 8 chars; init rejects any other length.
   db.prepare("INSERT INTO portals (token, owner_email, name, status, shared_view) VALUES ('agentpsh', 'mcp@harness.test', 'agent pushes', 'active', 0)").run();
 
@@ -129,69 +130,111 @@ const sha = buf => crypto.createHash('sha256').update(buf).digest('hex');
   await refused('missing file', path.join(WS, 'nope.bin'), 'file not found');
   check('no upload session was opened by any refusal', db.prepare('SELECT COUNT(*) AS c FROM upload_sessions').get().c === 0);
 
-  console.log('PUSH');
+  console.log('PUSH (default: a link)');
   const progress = [];
   const p1 = await call('push', { path: path.join(WS, 'report.bin') }, { onprogress: n => progress.push(n) });
   check('push ok with url/name/size', !p1.isError && p1.structuredContent && p1.structuredContent.name === 'report.bin' && p1.structuredContent.size === small.length && /^http.*\/big\/dl\/[0-9a-f]{32}$/.test(p1.structuredContent.url), JSON.stringify(p1));
-  check('text content carries the link', text(p1).includes(p1.structuredContent.url));
+  check('text content carries the link and names no portal', text(p1).includes(p1.structuredContent.url) && !text(p1).includes('portal'), text(p1));
   check('progress notifications arrived, monotonic, ending at total', progress.length >= 3 && progress.every((n, i) => i === 0 || n.progress >= progress[i - 1].progress) && progress[progress.length - 1].progress === small.length && progress[progress.length - 1].total === small.length, JSON.stringify(progress));
-  const row = db.prepare('SELECT token, file_size, portal_token, uploader_name FROM big_files WHERE filename = ?').get('report.bin');
-  check('file row in the seeded portal, uploader defaulted to owner', row && row.portal_token === 'agentpsh' && row.file_size === small.length && row.uploader_name === 'MCP User', JSON.stringify(row));
+  const linkTok = p1.structuredContent.url.split('/').pop();
+  const row = db.prepare('SELECT token, file_size, portal_token, email, note FROM big_files WHERE token = ?').get(linkTok);
+  check('file row is a portal-less link owned by the token\'s user, no note', row && row.portal_token === null && row.email === 'mcp@harness.test' && row.file_size === small.length && row.note === null, JSON.stringify(row));
   const dl = await fetch(APP + '/api/big/download/' + row.token, { redirect: 'follow' });
   check('downloaded bytes identical', dl.ok && sha(Buffer.from(await dl.arrayBuffer())) === sha(small));
-  check('session completed and pinned to the token', db.prepare("SELECT status, api_token_id FROM upload_sessions WHERE filename = 'report.bin'").get().api_token_id === 'tok-mcp');
+  check('session completed and pinned to the token', db.prepare("SELECT status, api_token_id FROM upload_sessions WHERE download_token = ?").get(linkTok).api_token_id === 'tok-mcp');
   check('token never appears in tool output', !JSON.stringify(p1).includes(secret) && !JSON.stringify(l).includes(secret));
 
-  console.log('PORTAL DEFAULTING');
+  console.log('NOTE');
+  const noted = await call('push', { path: path.join(WS, 'report.bin'), note: '  nightly build for QA\nsecond line  ' });
+  const notedRow = !noted.isError && db.prepare('SELECT note, portal_token FROM big_files WHERE token = ?').get(noted.structuredContent.url.split('/').pop());
+  check('note is stored on the file, trimmed, as a link', notedRow && notedRow.note === 'nightly build for QA\nsecond line' && notedRow.portal_token === null, JSON.stringify(noted));
+  const notedPage = await fetch(APP + '/big/dl/' + noted.structuredContent.url.split('/').pop());
+  check('note shows on the download page', notedPage.ok && (await notedPage.text()).includes('nightly build for QA'));
+  const blank = await call('push', { path: path.join(WS, 'report.bin'), note: '   ' });
+  check('blank note → no note stored', !blank.isError && db.prepare('SELECT note FROM big_files WHERE token = ?').get(blank.structuredContent.url.split('/').pop()).note === null, JSON.stringify(blank));
+  const longNote = await call('push', { path: path.join(WS, 'report.bin'), note: 'x'.repeat(501) });
+  check('note over 500 characters → refused by the schema, nothing pushed', longNote.isError && text(longNote).toLowerCase().includes('500'), text(longNote));
+
+  console.log('PUSH TO A PORTAL (by token)');
+  const pp = await call('push', { path: path.join(WS, 'report.bin'), portal: 'agentpsh', note: 'into the portal' });
+  const ppRow = !pp.isError && db.prepare('SELECT portal_token, uploader_name, email, note FROM big_files WHERE token = ?').get(pp.structuredContent.url.split('/').pop());
+  check('file row in the portal, uploader defaulted to owner, note kept', ppRow && ppRow.portal_token === 'agentpsh' && ppRow.uploader_name === 'MCP User' && ppRow.email === 'mcp@harness.test' && ppRow.note === 'into the portal', JSON.stringify(pp));
+  check('text content names the portal', text(pp).includes('portal "agent pushes"'), text(pp));
+
+  console.log('WHERE A PUSH GOES');
   db.prepare("INSERT INTO portals (token, owner_email, name, status, shared_view) VALUES ('secondpt', 'mcp@harness.test', 'Client Drop', 'active', 1)").run();
-  const lastPortal = () => db.prepare("SELECT portal_token FROM big_files WHERE filename = 'report.bin' ORDER BY rowid DESC").get().portal_token;
-  const amb = await call('push', { path: path.join(WS, 'report.bin') });
-  check('two active portals, none given → error listing name, token and mode of each',
-    amb.isError && text(amb).includes('2 active portals')
-    && text(amb).includes('agent pushes') && text(amb).includes('agentpsh') && text(amb).includes('inbox')
-    && text(amb).includes('Client Drop') && text(amb).includes('secondpt') && text(amb).includes('shared'),
-    text(amb));
-  // The argument is token-only now. A name must be refused, and nothing pushed.
-  const before = lastPortal();
+  const lastTarget = r => db.prepare('SELECT portal_token FROM big_files WHERE token = ?').get(r.structuredContent.url.split('/').pop()).portal_token;
+  const count = () => db.prepare('SELECT COUNT(*) AS c FROM big_files').get().c;
+  const two = await call('push', { path: path.join(WS, 'report.bin') });
+  check('two active portals, none given → a link, no error, no portal picked', !two.isError && lastTarget(two) === null, text(two));
+  // The argument is token-only. A name must be refused, and nothing pushed.
+  let before = count();
   const byName = await call('push', { path: path.join(WS, 'report.bin'), portal: 'client drop' });
-  check('portal argument by NAME → refused, points at list_portals, never pushes',
-    byName.isError && text(byName).includes('8-character portal token') && text(byName).includes('list_portals') && lastPortal() === before,
+  check('portal argument by NAME → refused, points at list_portals and at omitting portal, never pushes',
+    byName.isError && text(byName).includes('8-character portal token') && text(byName).includes('list_portals') && text(byName).includes('omit `portal`') && count() === before,
     text(byName));
   const byTok = await call('push', { path: path.join(WS, 'report.bin'), portal: 'secondpt' });
-  check('portal argument by TOKEN → pushed to it', !byTok.isError && lastPortal() === 'secondpt', text(byTok));
+  check('portal argument by TOKEN → pushed to it', !byTok.isError && lastTarget(byTok) === 'secondpt', text(byTok));
+  before = count();
   const badShape = await call('push', { path: path.join(WS, 'report.bin'), portal: 'nope' });
-  check('non-token argument ("nope") → refused as not-a-token', badShape.isError && text(badShape).includes('8-character portal token'), text(badShape));
+  check('non-token argument ("nope") → refused as not-a-token, nothing pushed', badShape.isError && text(badShape).includes('8-character portal token') && count() === before, text(badShape));
   const unknownTok = await call('push', { path: path.join(WS, 'report.bin'), portal: 'zzzzzzzz' });
-  check('well-formed but unknown token → error naming the choices', unknownTok.isError && text(unknownTok).includes('no portal has the token') && text(unknownTok).includes('agent pushes'), text(unknownTok));
+  check('well-formed but unknown token → error naming the choices, nothing pushed', unknownTok.isError && text(unknownTok).includes('no portal has the token') && text(unknownTok).includes('agent pushes') && count() === before, text(unknownTok));
   db.prepare("UPDATE portals SET status = 'deactivated' WHERE token = 'secondpt'").run();
   const deact = await call('push', { path: path.join(WS, 'report.bin'), portal: 'secondpt' });
-  check('deactivated portal by token → error', deact.isError && text(deact).includes('deactivated'), text(deact));
-  const single = await call('push', { path: path.join(WS, 'report.bin') });
-  check('one active again → defaults without arg', !single.isError, text(single));
+  check('deactivated portal by token → error, nothing pushed', deact.isError && text(deact).includes('deactivated') && count() === before, text(deact));
   db.prepare("UPDATE portals SET status = 'deactivated' WHERE token = 'agentpsh'").run();
   const none = await call('push', { path: path.join(WS, 'report.bin') });
-  check('zero active → error pointing at browser creation', none.isError && text(none).includes('/portal/new'), text(none));
+  check('zero active portals, none given → still a link', !none.isError && lastTarget(none) === null, text(none));
   db.prepare("UPDATE portals SET status = 'active' WHERE token = 'agentpsh'").run();
 
-  console.log('STICKAFILE_PORTAL (env default still accepts a name)');
+  console.log('STICKAFILE_PORTAL (env default: a portal instead of a link; a name is allowed here)');
   db.prepare("UPDATE portals SET status = 'active' WHERE token = 'secondpt'").run(); // two active, so the default actually selects
-  {
-    const t2 = new StdioClientTransport({
+  const spawnMcp = async (name, envExtra) => {
+    const t = new StdioClientTransport({
       command: process.execPath,
       args: [path.join(ROOT, 'src', 'index.js')],
       cwd: WS,
-      env: { ...process.env, STICKAFILE_TOKEN: secret, STICKAFILE_URL: APP, STICKAFILE_PORTAL: 'Client Drop' },
+      env: { ...process.env, STICKAFILE_TOKEN: secret, STICKAFILE_URL: APP, ...envExtra },
       stderr: 'pipe',
     });
-    const mcp2 = new Client({ name: 'e2e-env', version: '0' });
-    await mcp2.connect(t2);
+    const c = new Client({ name, version: '0' });
+    await c.connect(t);
+    return c;
+  };
+  {
+    const mcp2 = await spawnMcp('e2e-env', { STICKAFILE_PORTAL: 'Client Drop' });
     const envPush = await mcp2.callTool({ name: 'push', arguments: { path: path.join(WS, 'report.bin') } });
-    check('STICKAFILE_PORTAL set to a NAME → no-arg push resolves it (name still allowed in env)',
-      !envPush.isError && lastPortal() === 'secondpt',
+    check('STICKAFILE_PORTAL set to a NAME → no-arg push goes to that portal, not a link',
+      !envPush.isError && lastTarget(envPush) === 'secondpt',
       (envPush.content || []).map(c => c.text || '').join('\n'));
+    const envOverride = await mcp2.callTool({ name: 'push', arguments: { path: path.join(WS, 'report.bin'), portal: 'agentpsh' } });
+    check('explicit portal token still wins over STICKAFILE_PORTAL', !envOverride.isError && lastTarget(envOverride) === 'agentpsh');
     await mcp2.close().catch(() => {});
+    const mcp3 = await spawnMcp('e2e-env-bad', { STICKAFILE_PORTAL: 'No Such Portal' });
+    before = count();
+    const envBad = await mcp3.callTool({ name: 'push', arguments: { path: path.join(WS, 'report.bin') } });
+    check('STICKAFILE_PORTAL naming a missing portal → error, no silent fallback to a link',
+      envBad.isError && (envBad.content || []).map(c => c.text || '').join('\n').includes('STICKAFILE_PORTAL "No Such Portal" not found') && count() === before,
+      JSON.stringify(envBad));
+    await mcp3.close().catch(() => {});
   }
   db.prepare("UPDATE portals SET status = 'deactivated' WHERE token = 'secondpt'").run(); // restore: only agentpsh active
+
+  console.log('TOKEN WITHOUT links:push (an older, narrower token)');
+  {
+    const narrow = 'sf_' + crypto.randomBytes(32).toString('base64url');
+    db.prepare("INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, scopes) VALUES ('tok-narrow', 'u-mcp', 'narrow', ?, ?, 'portals:read portals:push')").run(sha(narrow), narrow.slice(0, 11));
+    const mcp4 = await spawnMcp('e2e-narrow', { STICKAFILE_TOKEN: narrow });
+    before = count();
+    const noLink = await mcp4.callTool({ name: 'push', arguments: { path: path.join(WS, 'report.bin') } });
+    check('no-portal push → the server\'s refusal is relayed, nothing pushed',
+      noLink.isError && (noLink.content || []).map(c => c.text || '').join('\n').includes('cannot create links') && count() === before,
+      JSON.stringify(noLink));
+    const toPortal = await mcp4.callTool({ name: 'push', arguments: { path: path.join(WS, 'report.bin'), portal: 'agentpsh' } });
+    check('portal push with the same token works', !toPortal.isError && lastTarget(toPortal) === 'agentpsh');
+    await mcp4.close().catch(() => {});
+  }
 
   console.log('BAD TOKEN');
   db.prepare("UPDATE api_tokens SET revoked_at = datetime('now') WHERE id = 'tok-mcp'").run();

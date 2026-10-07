@@ -1,4 +1,4 @@
-// Portal listing and the portal-defaulting rule.
+// Portal listing and the rule for where a push goes (a portal or a link).
 import { apiFetch } from './upload.js';
 
 export class ApiError extends Error {}
@@ -96,40 +96,43 @@ function listing(portals) {
   return portals.map(function (p) { return '"' + p.name + '" (token ' + p.token + ', ' + (p.sharedView ? 'shared' : 'inbox') + ')'; }).join(', ');
 }
 
-// Precedence: explicit push argument (token only) → STICKAFILE_PORTAL (name
-// or token) → the single active portal → an error that lists the choices.
-// Never picks silently among several: a push to the wrong shared portal
-// exposes the file to everyone holding that portal's link. The push argument
-// is deliberately token-only — a name is guessable, so accepting one lets a
-// model fabricate a plausible target; a token forces it through list_portals.
+// Where a push goes. Resolves to a portal entry, or null for a portal-less
+// link (a quick send owned by the token's user).
+//
+//   explicit push argument (token only)  → that portal
+//   else STICKAFILE_PORTAL (name or token) → that portal
+//   else                                   → null: a link
+//
+// The push argument is deliberately token-only: a name is guessable, so
+// accepting one lets a model fabricate a plausible target; a token forces it
+// through list_portals. A push to the wrong *shared* portal exposes the file
+// to everyone holding that portal's link, which is why nothing here ever
+// picks a portal on its own — with no argument and no STICKAFILE_PORTAL the
+// file becomes a link that only the account's owner and the people they send
+// it to can see. The link case makes no API call: a token with links:push
+// alone can push without being able to list portals.
 export async function choosePortal(client, arg, env) {
+  var argWant = arg && String(arg).trim();
+  var envWant = (env.STICKAFILE_PORTAL || '').trim();
+  if (!argWant && !envWant) return null;
+
   var portals = await listPortals(client);
   var active = portals.filter(function (p) { return p.status === 'active'; });
 
   // Explicit push argument: an 8-character portal token, nothing else.
-  var argWant = arg && String(arg).trim();
   if (argWant) {
     if (!TOKEN_RE.test(argWant)) {
-      throw new ApiError('`portal` must be an 8-character portal token, not a name (got "' + argWant + '"). Call list_portals to get the token of the portal you want, then pass that token. Do not guess. Portals on this account: ' + (portals.length ? listing(portals) : 'none'));
+      throw new ApiError('`portal` must be an 8-character portal token, not a name (got "' + argWant + '"). Call list_portals to get the token of the portal you want, then pass that token. Do not guess. Or omit `portal` to create a link instead. Portals on this account: ' + (portals.length ? listing(portals) : 'none'));
     }
     var found = matchToken(portals, argWant);
-    if (!found) throw new ApiError('no portal has the token "' + argWant + '" on this account. Call list_portals for the current tokens. Portals on this account: ' + (portals.length ? listing(portals) : 'none'));
-    if (found.status !== 'active') throw new ApiError('portal "' + found.name + '" (token ' + found.token + ') is deactivated; reactivate it at ' + client.baseUrl + '/links or choose another: ' + (active.length ? listing(active) : 'none active'));
+    if (!found) throw new ApiError('no portal has the token "' + argWant + '" on this account. Call list_portals for the current tokens, or omit `portal` to create a link instead. Portals on this account: ' + (portals.length ? listing(portals) : 'none'));
+    if (found.status !== 'active') throw new ApiError('portal "' + found.name + '" (token ' + found.token + ') is deactivated; reactivate it at ' + client.baseUrl + '/links, choose another (' + (active.length ? listing(active) : 'none active') + '), or omit `portal` to create a link instead.');
     return found;
   }
 
   // STICKAFILE_PORTAL: name or token, set by a human at install time.
-  var envWant = (env.STICKAFILE_PORTAL || '').trim();
-  if (envWant) {
-    var envFound = matchPortal(portals, envWant);
-    if (!envFound) throw new ApiError('STICKAFILE_PORTAL "' + envWant + '" not found. Portals on this account: ' + (portals.length ? listing(portals) : 'none'));
-    if (envFound.status !== 'active') throw new ApiError('STICKAFILE_PORTAL "' + envWant + '" is deactivated; reactivate it at ' + client.baseUrl + '/links or choose another: ' + (active.length ? listing(active) : 'none active'));
-    return envFound;
-  }
-
-  if (active.length === 1) return active[0];
-  if (active.length === 0) {
-    throw new ApiError('this account has no active portal to push to. Create one in the browser at ' + client.baseUrl + '/portal/new (API tokens cannot create portals), then push again.');
-  }
-  throw new ApiError('this account has ' + active.length + ' active portals; none was chosen. Ask the user which one, then pass `portal` with its 8-character token: ' + listing(active) + '. Or set STICKAFILE_PORTAL in the MCP server config as a default (name or token).');
+  var envFound = matchPortal(portals, envWant);
+  if (!envFound) throw new ApiError('STICKAFILE_PORTAL "' + envWant + '" not found. Portals on this account: ' + (portals.length ? listing(portals) : 'none') + '. Fix or unset STICKAFILE_PORTAL in the MCP server config.');
+  if (envFound.status !== 'active') throw new ApiError('STICKAFILE_PORTAL "' + envWant + '" is deactivated; reactivate it at ' + client.baseUrl + '/links, or fix or unset STICKAFILE_PORTAL in the MCP server config. Active portals: ' + (active.length ? listing(active) : 'none'));
+  return envFound;
 }

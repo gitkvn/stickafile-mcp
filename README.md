@@ -1,19 +1,21 @@
 # stickafile-mcp
 
-An MCP server that lets a coding agent upload a file from disk to a
-[Stickafile](https://stickafile.com) portal and hand back a shareable link.
-The bytes go from disk to storage and never enter the model's context.
+An MCP server that lets a coding agent upload a file from disk to
+[Stickafile](https://stickafile.com) and hand back a shareable link. The
+bytes go from disk to storage and never enter the model's context.
 
 Two tools:
 
-- `push(path, portal?)` → `{ url, name, size }`
+- `push(path, portal?, note?)` → `{ url, name, size }`
 - `list_portals()` → the portals the token can push to
+
+A push makes a standalone link by default. Pass a portal token when the file
+belongs in a project's portal instead.
 
 ## Install
 
 1. Sign in at [stickafile.com](https://stickafile.com), open the gear menu,
-   choose **api tokens**, and create one. Your first token also creates an
-   inbox-mode portal named "agent pushes" if you have none.
+   choose **api tokens**, and create one.
 2. Register the server with Claude Code, pasting the token:
 
    ```
@@ -48,24 +50,36 @@ Any MCP client works; the equivalent `.mcp.json` entry is:
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `STICKAFILE_TOKEN` | yes | An `sf_` API token. Scopes: list portals, push files. |
+| `STICKAFILE_TOKEN` | yes | An `sf_` API token. Scopes: list portals, push to portals, create links. |
 | `STICKAFILE_ALLOW` | no | Directories `push` may read from, separated by `:` (`;` on Windows). Default: the directory the server was started in, which Claude Code sets to the project. |
-| `STICKAFILE_PORTAL` | no | Default portal, by name or 8-character token, when `push` is called without one. |
+| `STICKAFILE_PORTAL` | no | Default portal, by name or 8-character token. When set, a `push` without `portal` goes there instead of making a link. |
 | `STICKAFILE_URL` | no | Base URL. Default `https://stickafile.com`. Point at a dev deploy to test. |
 
 Set them with more `-e` flags on `claude mcp add`, or in the `env` block of
 `.mcp.json`.
 
-## Choosing a portal
+## Links and portals
 
-When `push` is called without `portal`: `STICKAFILE_PORTAL` if set, otherwise
-the single active portal if there is exactly one, otherwise an error listing
-every active portal for the user to pick from. The server never picks silently
-among several.
+`push` without `portal` makes a **link**: a standalone file owned by your
+account, listed under Links on the dashboard, with no portal involved. This is
+the quick-send path and needs nothing configured beyond the token. The usual
+limits apply: 2 GB and 24 hours on the free plan, 10 GB and 30 days with pack
+credit.
 
-The `portal` argument itself takes an 8-character portal token (e.g.
-`a1b2c3d4`), never a name. A name is guessable and an agent can invent a
-plausible one; a token has to come from `list_portals`.
+`push` with `portal` puts the file in that **portal** instead, so it sits with
+a project's other files and the portal's own settings (gate, password, shared
+view) apply. The argument takes an 8-character portal token (e.g. `a1b2c3d4`),
+never a name. A name is guessable and an agent can invent a plausible one; a
+token has to come from `list_portals`.
+
+`STICKAFILE_PORTAL` changes the default: when it is set, a push without
+`portal` goes to that portal rather than making a link. An explicit `portal`
+token still wins. If the configured portal is missing or deactivated, the push
+fails rather than silently falling back to a link.
+
+`note` is optional plain text, up to 500 characters, shown on the download
+page under the file name. It is dropped on portals that have notes turned
+off.
 
 ## Safety
 
@@ -91,11 +105,11 @@ controls below run in the server and do not depend on the model behaving.
   because a hardlinked name can point at an inode whose home is outside the
   workspace; push a copy instead. The API token never appears in tool output.
 - **Portal choice.** A push to the wrong *shared* portal exposes the file to
-  everyone holding that portal's link. Requiring a token rather than a name
-  raises the bar, but an agent that has called `list_portals` can still pass
-  any token it saw. `STICKAFILE_PORTAL` is the only hard control: when it is
-  set, that portal is used unless the agent passes another token explicitly,
-  and there is no setting that forbids the argument.
+  everyone holding that portal's link. The default is therefore a link, which
+  only you and the people you send it to can open; the server never picks a
+  portal on its own. Requiring a token rather than a name for `portal` raises
+  the bar, but an agent that has called `list_portals` can still pass any
+  token it saw, and there is no setting that forbids the argument.
 
 Claude Code's own permission prompt is the human confirmation. The path shown
 there is the path that gets read.
