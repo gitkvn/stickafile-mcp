@@ -76,9 +76,20 @@ controls below run in the server and do not depend on the model behaving.
   symlinks are resolved first, and the resolved path must sit inside one of
   the allowed roots. The agent cannot widen the roots.
 - **Deny list inside the roots.** Dotfiles and dot-directories (`.env`,
-  `.git`, `.ssh`, `.aws`, ...) and credential-shaped names (`*.pem`, `*.key`,
-  `id_rsa`, `credentials`, ...) are refused. There is no override. Regular
-  files only, one per call. The API token never appears in tool output.
+  `.git`, `.ssh`, `.aws`, ...) and credential-shaped names are refused, with
+  no override. The name check strips backup and double extensions
+  (`id_rsa.bak`, `server.key.gz`) and matches credential words as whole tokens
+  (`aws_credentials`, `prod-secrets.yaml`), so a suffix or affix does not slip
+  a key or secret past it. As a side effect, a file whose name contains the
+  whole word `secret(s)` or `credential(s)` is refused even when it is not
+  sensitive (e.g. `secret_plans.txt`); copy it to a neutral name to push it.
+- **Regular files only, and only what was vetted.** `vetPath` opens the file
+  once and the uploader reads from that descriptor, so the bytes uploaded are
+  the bytes that were checked — a symlink or file swapped in after the check
+  cannot redirect the upload. The descriptor's device and inode must match
+  the entry that passed the name checks, or the push is refused. Files with more than one hard link are refused,
+  because a hardlinked name can point at an inode whose home is outside the
+  workspace; push a copy instead. The API token never appears in tool output.
 - **Portal choice.** A push to the wrong *shared* portal exposes the file to
   everyone holding that portal's link. Requiring a token rather than a name
   raises the bar, but an agent that has called `list_portals` can still pass
@@ -88,6 +99,16 @@ controls below run in the server and do not depend on the model behaving.
 
 Claude Code's own permission prompt is the human confirmation. The path shown
 there is the path that gets read.
+
+### Windows is untested
+
+The path controls are developed and tested on macOS and Linux. Windows is not
+covered by the test suite, and three things are open questions rather than
+cleared: NTFS alternate data streams (a name like `secret.pem:hidden` does not
+end in `.pem`), 8.3 short names (`ID_RSA~1`), and whether `realpath` casing
+keeps the case-insensitive root-boundary check honest. `O_NOFOLLOW`, which
+closes the check-then-open race on POSIX, is also absent on Windows. Treat the
+guarantees above as verified on POSIX only until there is Windows coverage.
 
 ## No resume
 

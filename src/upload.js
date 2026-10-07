@@ -22,7 +22,6 @@
 //     file per call, so there is nothing to parallelise at that layer;
 //   - no resume: a failed push restarts from the beginning and the server
 //     sweeps the orphaned session.
-import { open } from 'node:fs/promises';
 
 var RETRY_MAX_ATTEMPTS = 5;
 var RETRY_BASE_MS = 1000;
@@ -82,7 +81,9 @@ async function uploadToR2(presignedUrl, buf) {
 
 // Upload one file. opts:
 //   client      — { baseUrl, token }
-//   filePath    — absolute path (already vetted by safety.js)
+//   fh          — an open FileHandle for the vetted file (from safety.js);
+//                 read here, closed by the caller
+//   filePath    — absolute path (already vetted; used only in messages)
 //   name, size  — basename and byte length
 //   mimeType
 //   portalToken — 8-char portal token
@@ -114,7 +115,9 @@ export async function uploadFile(opts) {
   var data = await initRes.json();
   var sess = data.sessions[0];
 
-  var fh = await open(opts.filePath, 'r');
+  // The descriptor is opened and vetted in safety.vetPath and owned by the
+  // caller; we read from it and never reopen opts.filePath by path.
+  var fh = opts.fh;
   try {
     // Presigned URLs keyed by chunk index. Init returns the first 100 as an
     // array; the presign continuation endpoint returns an OBJECT keyed by
@@ -244,15 +247,18 @@ export async function uploadFile(opts) {
     }
     // Complete's downloadUrl is the authoritative share link; fall back to
     // the init download token only if this body didn't parse.
+    // complete returned ok: the file is finalized and public. This is NOT a
+    // failure, even if the body did not parse. Surface the best link we can
+    // build; if none is available, return url:null and let the caller say the
+    // upload succeeded but the link could not be read (never report failure).
     var url = null;
     try {
       var completeData = await completeRes.json();
       if (completeData && completeData.downloadUrl) url = completeData.downloadUrl;
     } catch {}
     if (!url && sess.downloadToken) url = client.baseUrl + '/big/dl/' + sess.downloadToken;
-    if (!url) throw new UploadError('upload finished but no link came back');
     return { url: url, name: opts.name, size: opts.size };
   } finally {
-    await fh.close().catch(function () {});
+    // fh is owned by the caller (safety.vetPath opened it); closed there.
   }
 }

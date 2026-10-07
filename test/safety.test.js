@@ -114,4 +114,90 @@ test('a plain file inside the root is accepted', async () => {
   assert.equal(f.name, 'report.bin');
   assert.equal(f.size, 5);
   assert.equal(f.path, fs.realpathSync(p));
+  assert.equal(typeof f.fd, 'number', 'the vetted result carries the open descriptor');
+  await f.fh.close();
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Adversarial findings, 2026-09-12. Each test below encodes the SECURE
+// behaviour and FAILS against the current safety.js — it marks a confirmed
+// bypass to be fixed. Do not delete a test to make the suite green; fix
+// src/safety.js until it passes.
+// ─────────────────────────────────────────────────────────────────────────
+
+// FINDING 1 — deny-list regex is anchored to a single optional extension, so
+// any credential/key file with a second extension, a backup suffix, or a
+// prefix slips through. Confirmed accepted by vetPath.
+test('FINDING1: key/credential files with a backup or double extension are refused', async () => {
+  for (const n of [
+    'id_rsa.bak', 'id_rsa.old', 'id_rsa.1', 'id_ed25519.bak',
+    'server.key.bak', 'server.pem.bak', 'server.pem.gz', 'cert.crt.bak',
+    'credentials.json.bak', 'secrets.tar.gz',
+  ]) {
+    await refused(n, /credential or key file/);
+  }
+});
+
+// FINDING 1b — credential names with a prefix/suffix (not an extension) also
+// slip through: the name group is not a substring test.
+test('FINDING1b: affixed credential names are refused', async () => {
+  for (const n of ['aws_credentials', 'prod-secrets.yaml', 'credentials-prod', 'my_secret_token']) {
+    await refused(n, /credential or key file/);
+  }
+});
+
+// FINDING 1c — real SSH filenames outside the exact anchored set. authorized_keys2
+// is a genuine OpenSSH file; known_hosts.old is a routine backup.
+test('FINDING1c: authorized_keys2 and known_hosts.old are refused', async () => {
+  await refused('authorized_keys2', /credential or key file/);
+  await refused('known_hosts.old', /credential or key file/);
+});
+
+// FINDING 2 — hardlinks are not symlinks, so realpath() does not resolve them.
+// A benign-named hardlink whose inode is an out-of-root file is accepted,
+// defeating both the root boundary and the deny list at once.
+test('FINDING2: a hardlink whose inode lives outside the root is refused', async () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-hl-out-'));
+  const target = path.join(outside, 'id_rsa');
+  fs.writeFileSync(target, 'PRIVATE KEY BYTES');
+  const link = path.join(WS, 'hardlinked-report.bin');
+  fs.linkSync(target, link);
+  await assert.rejects(() => vetPath(link, roots), (e) => {
+    assert.ok(e instanceof PathRefused, `expected refusal, got ${e}`);
+    return true;
+  });
+  fs.rmSync(outside, { recursive: true, force: true });
+});
+
+// FINDING 3 — check/reopen TOCTOU. vetPath resolves and stats a path, then
+// returns a plain string; upload.js reopens that string by path. Swapping the
+// entry for a symlink to an outside file between the two steps makes the
+// upload read out-of-root bytes. The vetted result must pin the exact bytes
+// that were vetted (e.g. carry an open fd the uploader reads), so a post-vet
+// filesystem swap cannot change what is uploaded.
+test('FINDING3: the vetted file cannot be swapped for outside content after vetting', async () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-toctou-out-'));
+  const secret = path.join(outside, 'passwd');
+  fs.writeFileSync(secret, 'OUT-OF-ROOT SECRET');
+  const victim = path.join(WS, 'swap.bin');
+  fs.writeFileSync(victim, 'IN-ROOT DATA');
+
+  const vetted = await vetPath(victim, roots);
+  // Attacker replaces the just-vetted entry with a symlink out of the root.
+  fs.rmSync(victim);
+  fs.symlinkSync(secret, victim);
+
+  // What the uploader would actually send. Prefer a pinned fd if vetPath
+  // grew one; otherwise reproduce upload.js's reopen-by-path.
+  let uploaded;
+  if (typeof vetted.fd === 'number') {
+    const buf = Buffer.alloc(64);
+    const { bytesRead } = fs.readSync(vetted.fd, buf, 0, 64, 0);
+    uploaded = buf.slice(0, bytesRead).toString('utf8');
+  } else {
+    uploaded = fs.readFileSync(vetted.path, 'utf8');
+  }
+  assert.doesNotMatch(uploaded, /OUT-OF-ROOT SECRET/, 'post-vet swap changed the uploaded bytes (TOCTOU)');
+  if (vetted.fh) await vetted.fh.close();
+  fs.rmSync(outside, { recursive: true, force: true });
 });

@@ -34,7 +34,13 @@ if (!token.startsWith('sf_')) {
 }
 const baseUrl = (process.env.STICKAFILE_URL || 'https://stickafile.com').trim().replace(/\/+$/, '');
 const client = { baseUrl, token };
-const roots = await resolveRoots(process.env);
+let roots;
+try {
+  roots = await resolveRoots(process.env);
+} catch (e) {
+  log(e.message + ' Set STICKAFILE_ALLOW in the MCP server config to an existing directory, or unset it to use the launch directory.');
+  process.exit(1);
+}
 
 // Probe the token once before accepting connections, so a revoked token is
 // reported here, in the MCP client's server log, instead of on the first
@@ -108,39 +114,50 @@ server.registerTool('push', {
     throw e;
   }
 
-  let portal;
-  try { portal = await choosePortal(client, portalArg, process.env); }
-  catch (e) {
-    if (e instanceof ApiError) return fail(e.message);
-    if (e.message === 'cancelled') return fail('push cancelled');
-    return fail('could not reach ' + baseUrl + ': ' + e.message);
-  }
-
-  log('push ' + file.path + ' (' + human(file.size) + ') → portal "' + portal.name + '" (' + portal.token + ')');
-
-  const progressToken = extra._meta && extra._meta.progressToken;
-  let lastPct = -1;
-  const onProgress = ({ sent, total, pct }) => {
-    if (progressToken === undefined || pct === lastPct) return;
-    lastPct = pct;
-    extra.sendNotification({
-      method: 'notifications/progress',
-      params: { progressToken, progress: sent, total, message: pct + '% · ' + human(sent) + ' of ' + human(total) + ' → ' + portal.name },
-    }).catch(() => {});
-  };
-
+  // From here on the vetted descriptor (file.fh) is open; close it on every path.
   try {
-    const result = await uploadFile({
-      client, filePath: file.path, name: file.name, size: file.size, mimeType: mimeFor(file.name),
-      portalToken: portal.token, onProgress, signal: extra.signal,
-    });
-    log('done ' + result.url);
-    return ok(result, 'Uploaded ' + result.name + ' (' + human(result.size) + ') to portal "' + portal.name + '".\nLink: ' + result.url);
-  } catch (e) {
-    if (e instanceof UploadError) { log('push failed: ' + e.message); return fail('Upload of ' + file.name + ' (' + human(file.size) + ') failed after sending part of the file: ' + e.message + '. DO NOT retry automatically. There is no resume, so a retry re-sends the entire ' + human(file.size) + ' from the start. Ask the user whether to retry before calling push again.'); }
-    if (e.message === 'cancelled') { log('push cancelled'); return fail('push cancelled; nothing was published'); }
-    log('push error: ' + (e.stack || e.message));
-    return fail('Upload of ' + file.name + ' (' + human(file.size) + ') failed after sending part of the file: ' + e.message + '. DO NOT retry automatically. There is no resume, so a retry re-sends the entire ' + human(file.size) + ' from the start. Ask the user whether to retry before calling push again.');
+    let portal;
+    try { portal = await choosePortal(client, portalArg, process.env); }
+    catch (e) {
+      if (e instanceof ApiError) return fail(e.message);
+      if (e.message === 'cancelled') return fail('push cancelled');
+      return fail('could not reach ' + baseUrl + ': ' + e.message);
+    }
+
+    log('push ' + file.path + ' (' + human(file.size) + ') → portal "' + portal.name + '" (' + portal.token + ')');
+
+    const progressToken = extra._meta && extra._meta.progressToken;
+    let lastPct = -1;
+    const onProgress = ({ sent, total, pct }) => {
+      if (progressToken === undefined || pct === lastPct) return;
+      lastPct = pct;
+      extra.sendNotification({
+        method: 'notifications/progress',
+        params: { progressToken, progress: sent, total, message: pct + '% · ' + human(sent) + ' of ' + human(total) + ' → ' + portal.name },
+      }).catch(() => {});
+    };
+
+    try {
+      const result = await uploadFile({
+        client, fh: file.fh, filePath: file.path, name: file.name, size: file.size, mimeType: mimeFor(file.name),
+        portalToken: portal.token, onProgress, signal: extra.signal,
+      });
+      if (result.url) {
+        log('done ' + result.url);
+        return ok(result, 'Uploaded ' + result.name + ' (' + human(result.size) + ') to portal "' + portal.name + '".\nLink: ' + result.url);
+      }
+      // Upload finalized, but the server returned no readable link. Report
+      // success plainly; never claim failure for a file that is now public.
+      log('done (upload finalized; no link returned by the server)');
+      return ok({ ...result, url: '' }, 'Uploaded ' + result.name + ' (' + human(result.size) + ') to portal "' + portal.name + '". The upload succeeded, but the server did not return a readable download link — find it at ' + baseUrl + '/links.');
+    } catch (e) {
+      if (e instanceof UploadError) { log('push failed: ' + e.message); return fail('Upload of ' + file.name + ' (' + human(file.size) + ') failed after sending part of the file: ' + e.message + '. DO NOT retry automatically. There is no resume, so a retry re-sends the entire ' + human(file.size) + ' from the start. Ask the user whether to retry before calling push again.'); }
+      if (e.message === 'cancelled') { log('push cancelled'); return fail('push cancelled; nothing was published'); }
+      log('push error: ' + (e.stack || e.message));
+      return fail('Upload of ' + file.name + ' (' + human(file.size) + ') failed after sending part of the file: ' + e.message + '. DO NOT retry automatically. There is no resume, so a retry re-sends the entire ' + human(file.size) + ' from the start. Ask the user whether to retry before calling push again.');
+    }
+  } finally {
+    await file.fh.close().catch(() => {});
   }
 });
 

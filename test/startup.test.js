@@ -41,9 +41,9 @@ const hang = () => {}; // never answers
 
 // Launch src/index.js against a base URL. Resolves once the process either
 // exits or prints its "ready" line, whichever comes first.
-function launch(baseUrl) {
+function launch(baseUrl, envOverride = {}) {
   const child = spawn(process.execPath, [INDEX], {
-    env: { ...process.env, STICKAFILE_TOKEN: 'sf_startup_test', STICKAFILE_URL: baseUrl, STICKAFILE_ALLOW: os.tmpdir() },
+    env: { ...process.env, STICKAFILE_TOKEN: 'sf_startup_test', STICKAFILE_URL: baseUrl, STICKAFILE_ALLOW: os.tmpdir(), ...envOverride },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stderr = '', stdout = '';
@@ -136,4 +136,19 @@ test('verifyToken: timeout is bounded and reported as unknown, not rejected', as
     assert.match(r.detail, /no response within 300 ms/);
     assert.ok(took < 1500, 'returned in ' + took + ' ms');
   } finally { await api.close(); }
+});
+
+// FINDING 5 — a STICKAFILE_ALLOW directory that does not exist must produce
+// one clean line and exit 1, not an unhandled rejection with a stack trace.
+test('nonexistent STICKAFILE_ALLOW → exits 1 with a clean message, no stack trace', async () => {
+  const missing = path.join(os.tmpdir(), 'sf-no-such-dir-' + process.pid);
+  const proc = launch('http://127.0.0.1:1', { STICKAFILE_ALLOW: missing });
+  const r = await proc.settled;
+  assert.equal(r.exited, true, 'process should have exited; stderr=' + proc.stderr);
+  assert.equal(r.code, 1);
+  assert.match(proc.stderr, /STICKAFILE_ALLOW root does not exist/);
+  assert.match(proc.stderr, new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'the offending directory is named');
+  assert.doesNotMatch(proc.stderr, /\n\s+at /, 'no stack trace');
+  assert.doesNotMatch(proc.stderr, /\] ready/);
+  assert.equal(proc.stdout, '', 'nothing written to the MCP channel');
 });
