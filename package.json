@@ -1,6 +1,6 @@
 {
   "name": "stickafile-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "MCP server that uploads a file from disk to Stickafile and returns a shareable link, standalone or in a portal. The bytes never enter the model's context.",
   "type": "module",
   "bin": {

@@ -111,8 +111,9 @@ controls below run in the server and do not depend on the model behaving.
 - **Regular files only, and only what was vetted.** `vetPath` opens the file
   once and the uploader reads from that descriptor, so the bytes uploaded are
   the bytes that were checked — a symlink or file swapped in after the check
-  cannot redirect the upload. The descriptor's device and inode must match
-  the entry that passed the name checks, or the push is refused. Files with
+  cannot redirect the upload. The descriptor's device and inode (on Windows,
+  volume serial and NTFS file ID) must match the entry that passed the name
+  checks, or the push is refused. Files with
   more than one hard link are refused, because a hardlinked name can point at
   an inode whose home is outside the workspace. If you do want to send one,
   make a copy yourself by hand and push the copy; the agent is told to ask
@@ -134,16 +135,41 @@ there is the path that gets read.
   prompt injection wants sent. Approving each upload yourself is the main
   defence against an injected instruction uploading a project file.
 
-### Windows is not supported yet
+### Known gap: a parent directory swapped mid-check
 
-On Windows the server exits at startup with "Windows isn't supported yet".
-Use macOS, Linux, or WSL. The path controls are developed and tested on macOS
-and Linux; Windows is not yet covered by the test suite, and three things are
-open questions rather than cleared: NTFS alternate data streams (a name like `secret.pem:hidden` does not
-end in `.pem`), 8.3 short names (`ID_RSA~1`), and whether `realpath` casing
-keeps the case-insensitive root-boundary check honest. `O_NOFOLLOW`, which
-closes the check-then-open race on POSIX, is also absent on Windows. Treat the
-guarantees above as verified on POSIX only until there is Windows coverage.
+The open-once check pins the *file*: if the vetted entry is swapped for a
+symlink, junction, or other file before the open, the identity check refuses
+it. It does not pin the *directories above it*. A process that can write
+inside an allowed root could replace a parent directory with a link to
+somewhere else between the path being resolved and the file being opened,
+then put it back; the open and the identity check would then agree on the
+outside file. This applies on every platform. Closing it needs the
+operating system's path for the open handle (`GetFinalPathNameByHandle`,
+`F_GETPATH`, `/proc/self/fd`), which Node does not expose without a native
+module. It matters only if something other than you can write into an
+allowed folder and race the server, for example an agent whose shell is
+sandboxed without network access while this server has it.
+
+### Windows
+
+Supported on Windows 10/11 and tested in CI on `windows-latest` (Node 20
+and 22) alongside macOS and Linux. Separate `STICKAFILE_ALLOW` entries with
+`;`, e.g. `C:\Users\me\work;D:\exports`; forward slashes and any drive-letter
+case work. Windows-specific behaviour:
+
+- NTFS alternate data streams (`notes.txt:payload`, `report.pdf::$DATA`) are
+  refused; only a file's main contents are uploaded.
+- Reserved device names (`CON`, `NUL`, `COM1`, `con.txt`, ...) are refused,
+  and so are `\\.\` device paths and `\\?\GLOBALROOT` paths. `\\?\C:\...`
+  long paths work.
+- 8.3 short names (`IDED~1`, `SSHDIR~1`) are resolved to the long name before
+  the name checks, so they cannot hide a denied name.
+- Names ending in dots or spaces (`id_rsa.`, `server.pem `) are checked as if
+  the trailing characters were not there.
+- Junctions are treated like symlinks: resolved first, then held to the root.
+  NTFS hard links are refused like any other multi-link file.
+- Windows has no `O_NOFOLLOW`. A swap of the file between the check and the
+  open is caught by the file-ID check instead.
 
 ## No resume
 
