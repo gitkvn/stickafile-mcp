@@ -164,6 +164,9 @@ test('FINDING2: a hardlink whose inode lives outside the root is refused', async
   fs.linkSync(target, link);
   await assert.rejects(() => vetPath(link, roots), (e) => {
     assert.ok(e instanceof PathRefused, `expected refusal, got ${e}`);
+    // The refusal sends the decision to the user; it must not tell the agent to copy.
+    assert.match(e.message, /This file has multiple hard links, so it can't be uploaded safely\. Ask the user whether they want to make a copy themselves\./);
+    assert.doesNotMatch(e.message, /push a copy/i);
     return true;
   });
   fs.rmSync(outside, { recursive: true, force: true });

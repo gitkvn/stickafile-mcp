@@ -58,6 +58,14 @@ Any MCP client works; the equivalent `.mcp.json` entry is:
 Set them with more `-e` flags on `claude mcp add`, or in the `env` block of
 `.mcp.json`.
 
+## Agent skill
+
+[`skills/stickafile/`](skills/stickafile/SKILL.md) is an agent skill that
+teaches an agent when to push a file, when to pass a portal, and what to do
+when a push fails or is refused. It is also listed on
+[Agensi](https://agensi.io). To use it directly, copy the folder into your
+agent's skills directory (for Claude Code, `~/.claude/skills/stickafile/`).
+
 ## Links and portals
 
 `push` without `portal` makes a **link**: a standalone file owned by your
@@ -96,14 +104,19 @@ controls below run in the server and do not depend on the model behaving.
   (`aws_credentials`, `prod-secrets.yaml`), so a suffix or affix does not slip
   a key or secret past it. As a side effect, a file whose name contains the
   whole word `secret(s)` or `credential(s)` is refused even when it is not
-  sensitive (e.g. `secret_plans.txt`); copy it to a neutral name to push it.
+  sensitive (e.g. `secret_plans.txt`). If that is a false positive, you can
+  rename it or copy it to a neutral name yourself, by hand, and push that.
+  This is for the user to do; the agent is told never to rename or copy a
+  file to get it past a refusal.
 - **Regular files only, and only what was vetted.** `vetPath` opens the file
   once and the uploader reads from that descriptor, so the bytes uploaded are
   the bytes that were checked — a symlink or file swapped in after the check
   cannot redirect the upload. The descriptor's device and inode must match
-  the entry that passed the name checks, or the push is refused. Files with more than one hard link are refused,
-  because a hardlinked name can point at an inode whose home is outside the
-  workspace; push a copy instead. The API token never appears in tool output.
+  the entry that passed the name checks, or the push is refused. Files with
+  more than one hard link are refused, because a hardlinked name can point at
+  an inode whose home is outside the workspace. If you do want to send one,
+  make a copy yourself by hand and push the copy; the agent is told to ask
+  you rather than make it. The API token never appears in tool output.
 - **Portal choice.** A push to the wrong *shared* portal exposes the file to
   everyone holding that portal's link. The default is therefore a link, which
   only you and the people you send it to can open; the server never picks a
@@ -113,6 +126,13 @@ controls below run in the server and do not depend on the model behaving.
 
 Claude Code's own permission prompt is the human confirmation. The path shown
 there is the path that gets read.
+
+- **Don't allowlist or auto-approve `push`.** Leave it out of
+  `permissions.allow` and don't answer its prompt with "don't ask again".
+  The checks above stop keys, secrets and files outside the workspace, but
+  they cannot tell an ordinary project file you meant to share from one a
+  prompt injection wants sent. Approving each upload yourself is the main
+  defence against an injected instruction uploading a project file.
 
 ### Windows is untested
 

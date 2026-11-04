@@ -9,3 +9,5 @@ node_modules/
 !.claude/hooks/
 # local test scratch (test/e2e.js)
 test/.tmp/
+# built skill bundle (upload artifact, rebuilt from skills/stickafile/)
+skills/*.zip

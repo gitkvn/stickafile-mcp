@@ -129,8 +129,9 @@ export async function vetPath(input, roots) {
     // A hardlink is not a symlink, so realpath cannot tell that this name is a
     // second link to an inode whose home may be outside the root (the finding-2
     // bypass). Refuse any file with more than one link; the fix for a genuine
-    // multi-link file the user wants to send is to push a copy of it.
-    if (st.nlink > 1) throw new PathRefused('refused: ' + real + ' has ' + st.nlink + ' hard links; a hardlinked name can point at content outside the workspace, so it is not uploaded. Push a copy instead.');
+    // multi-link file is for the user to decide on: the message tells the
+    // agent to ask, never to make the copy itself.
+    if (st.nlink > 1) throw new PathRefused('refused: ' + real + '. This file has multiple hard links, so it can\'t be uploaded safely. Ask the user whether they want to make a copy themselves.');
     return { fd: fh.fd, fh: fh, path: real, name: path.basename(real), size: st.size };
   } catch (e) {
     await fh.close().catch(function () {});
