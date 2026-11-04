@@ -134,11 +134,12 @@ there is the path that gets read.
   prompt injection wants sent. Approving each upload yourself is the main
   defence against an injected instruction uploading a project file.
 
-### Windows is untested
+### Windows is not supported yet
 
-The path controls are developed and tested on macOS and Linux. Windows is not
-covered by the test suite, and three things are open questions rather than
-cleared: NTFS alternate data streams (a name like `secret.pem:hidden` does not
+On Windows the server exits at startup with "Windows isn't supported yet".
+Use macOS, Linux, or WSL. The path controls are developed and tested on macOS
+and Linux; Windows is not yet covered by the test suite, and three things are
+open questions rather than cleared: NTFS alternate data streams (a name like `secret.pem:hidden` does not
 end in `.pem`), 8.3 short names (`ID_RSA~1`), and whether `realpath` casing
 keeps the case-insensitive root-boundary check honest. `O_NOFOLLOW`, which
 closes the check-then-open race on POSIX, is also absent on Windows. Treat the

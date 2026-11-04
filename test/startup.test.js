@@ -19,11 +19,15 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { verifyToken } from '../src/api.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const INDEX = path.join(HERE, '..', 'src', 'index.js');
+const FAKE_WIN32 = pathToFileURL(path.join(HERE, 'fixtures', 'fake-win32.mjs')).href;
+// While the interim Windows guard is in place, every test that expects the
+// server to get past startup is skipped on a real Windows host.
+const WIN_GUARD = process.platform === 'win32' && 'interim Windows guard: the server exits at startup';
 
 // A stub API on a free loopback port. handler(req, res) may leave the
 // response unanswered to simulate a hang.
@@ -41,8 +45,8 @@ const hang = () => {}; // never answers
 
 // Launch src/index.js against a base URL. Resolves once the process either
 // exits or prints its "ready" line, whichever comes first.
-function launch(baseUrl, envOverride = {}) {
-  const child = spawn(process.execPath, [INDEX], {
+function launch(baseUrl, envOverride = {}, nodeArgs = []) {
+  const child = spawn(process.execPath, [...nodeArgs, INDEX], {
     env: { ...process.env, STICKAFILE_TOKEN: 'sf_startup_test', STICKAFILE_URL: baseUrl, STICKAFILE_ALLOW: os.tmpdir(), ...envOverride },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -75,7 +79,7 @@ async function initialize(proc) {
 }
 
 for (const status of [401, 403]) {
-  test('rejected token (' + status + ') → exits 1 with causes named, never serves', async () => {
+  test('rejected token (' + status + ') → exits 1 with causes named, never serves', { skip: WIN_GUARD }, async () => {
     const api = await stub(reply(status, { error: 'token revoked' }));
     try {
       const proc = launch(api.url);
@@ -99,7 +103,7 @@ const transient = [
   ['connection refused', async () => { const s = await stub(hang); const url = s.url; await s.close(); return { url, close: async () => {} }; }, /ECONNREFUSED/],
 ];
 for (const [label, make, expect] of transient) {
-  test('transient failure (' + label + ') → starts anyway and answers initialize', async () => {
+  test('transient failure (' + label + ') → starts anyway and answers initialize', { skip: WIN_GUARD }, async () => {
     const api = await make();
     const proc = launch(api.url);
     try {
@@ -140,7 +144,7 @@ test('verifyToken: timeout is bounded and reported as unknown, not rejected', as
 
 // FINDING 5 — a STICKAFILE_ALLOW directory that does not exist must produce
 // one clean line and exit 1, not an unhandled rejection with a stack trace.
-test('nonexistent STICKAFILE_ALLOW → exits 1 with a clean message, no stack trace', async () => {
+test('nonexistent STICKAFILE_ALLOW → exits 1 with a clean message, no stack trace', { skip: WIN_GUARD }, async () => {
   const missing = path.join(os.tmpdir(), 'sf-no-such-dir-' + process.pid);
   const proc = launch('http://127.0.0.1:1', { STICKAFILE_ALLOW: missing });
   const r = await proc.settled;
@@ -151,4 +155,24 @@ test('nonexistent STICKAFILE_ALLOW → exits 1 with a clean message, no stack tr
   assert.doesNotMatch(proc.stderr, /\n\s+at /, 'no stack trace');
   assert.doesNotMatch(proc.stderr, /\] ready/);
   assert.equal(proc.stdout, '', 'nothing written to the MCP channel');
+});
+
+// Interim Windows guard (0.2.1): on win32 the server exits 1 before reading
+// the token or touching the network, with a message that says so. The
+// platform is faked with a preload, so this runs on every OS.
+test('Windows → exits 1 with "not supported yet", before any token check or request', async () => {
+  let hits = 0;
+  const api = await stub((req, res) => { hits++; reply(200, { portals: [] })(req, res); });
+  try {
+    const proc = launch(api.url, { STICKAFILE_TOKEN: '' }, ['--import', FAKE_WIN32]);
+    const r = await proc.settled;
+    assert.equal(r.exited, true, 'process should have exited; stderr=' + proc.stderr);
+    assert.equal(r.code, 1);
+    assert.match(proc.stderr, /Windows isn't supported yet/);
+    assert.doesNotMatch(proc.stderr, /STICKAFILE_TOKEN/, 'guard runs before the token check');
+    assert.doesNotMatch(proc.stderr, /\n\s+at /, 'no stack trace');
+    assert.doesNotMatch(proc.stderr, /\] ready/);
+    assert.equal(proc.stdout, '', 'nothing written to the MCP channel');
+    assert.equal(hits, 0, 'no request reached the API');
+  } finally { await api.close(); }
 });

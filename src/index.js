@@ -26,6 +26,14 @@ const { version } = createRequire(import.meta.url)('../package.json');
 
 function log(msg) { process.stderr.write('[stickafile-mcp] ' + msg + '\n'); }
 
+// Interim guard: the path-safety checks are not yet verified on Windows
+// (alternate data streams, 8.3 names, junctions, the open-time race), so
+// refuse to start there rather than run with unproven guarantees.
+if (process.platform === 'win32') {
+  log('Windows isn\'t supported yet: the path-safety checks have not been verified on Windows. Run stickafile-mcp on macOS or Linux (including WSL). Windows support is in progress.');
+  process.exit(1);
+}
+
 const token = (process.env.STICKAFILE_TOKEN || '').trim();
 if (!token) {
   log('STICKAFILE_TOKEN is not set. Create a token at https://stickafile.com/links (settings → api tokens) and pass it in the MCP server config.');
