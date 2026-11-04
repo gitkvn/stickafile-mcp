@@ -17,7 +17,10 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { vetPath, resolveRoots, PathRefused } from '../src/safety.js';
 
-const WS = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-safety-'));
+// Long-form path: on the Windows runner os.tmpdir() is the 8.3 spelling
+// (C:\Users\RUNNER~1\...), and vetPath reports the long one.
+const WS_AS_CREATED = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-safety-'));
+const WS = fs.realpathSync.native(WS_AS_CREATED);
 process.on('exit', () => { try { fs.rmSync(WS, { recursive: true, force: true }); } catch {} });
 // The allowed root IS the workspace, so nothing below is refused for being
 // outside it. Every refusal here is the name/shape deny list doing its job.
@@ -212,7 +215,7 @@ test('FINDING3: the vetted file cannot be swapped for outside content after vett
 // would swap the entry. On POSIX, O_NOFOLLOW or the identity check catches
 // it; on Windows (no O_NOFOLLOW) the identity check must do it alone.
 // ─────────────────────────────────────────────────────────────────────────
-const OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-out-'));
+const OUT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'sf-out-')));
 process.on('exit', () => { try { fs.rmSync(OUT, { recursive: true, force: true }); } catch {} });
 const OUT_FILE = path.join(OUT, 'report.txt'); // benign name: only the root check stands in the way
 fs.writeFileSync(OUT_FILE, 'OUT-OF-ROOT CONTENT');
@@ -279,12 +282,12 @@ const fsutil = (...args) => execFileSync('fsutil', args, { stdio: 'pipe' }).toSt
 test('WIN ADS: alternate data streams are refused, whatever the main file is called', onWin, async () => {
   write('secret.pem', 'cert');
   fs.writeFileSync(path.join(R, 'secret.pem:hidden'), 'HIDDEN');
-  write('notes.txt', 'plain notes');
-  fs.writeFileSync(path.join(R, 'notes.txt:payload'), 'SMUGGLED');
-  for (const s of ['secret.pem:hidden', 'notes.txt::$DATA', 'notes.txt:payload', 'notes.txt:payload:$DATA']) {
+  write('ads-notes.txt', 'plain notes');
+  fs.writeFileSync(path.join(R, 'ads-notes.txt:payload'), 'SMUGGLED');
+  for (const s of ['secret.pem:hidden', 'ads-notes.txt::$DATA', 'ads-notes.txt:payload', 'ads-notes.txt:payload:$DATA']) {
     await refuses(path.join(R, s), /alternate data stream/);
   }
-  await accepts(path.join(R, 'notes.txt')); // control: the main stream is fine
+  await accepts(path.join(R, 'ads-notes.txt')); // control: the main stream is fine
 });
 
 test('WIN 8.3: short names resolve to the long name before the name check', onWin, async (t) => {
@@ -301,6 +304,8 @@ test('WIN 8.3: short names resolve to the long name before the name check', onWi
     return;
   }
   await refuses(path.join(R, 'IDED~1'), /credential or key/);
+  // STICKAFILE_ALLOW in 8.3 form names the same root.
+  if (WS_AS_CREATED !== WS) assert.deepEqual(await resolveRoots({ STICKAFILE_ALLOW: WS_AS_CREATED }), roots, 'short-form root ' + WS_AS_CREATED);
   await refuses(path.join(R, 'SSHDIR~1', 'notes.txt'), /dot-directory/);
   const v = await accepts(path.join(R, 'LONGRE~1.TXT'));
   assert.equal(v.path, plain, 'short name resolved to the long one');
@@ -309,8 +314,11 @@ test('WIN 8.3: short names resolve to the long name before the name check', onWi
 test('WIN trailing dots and spaces: stripped names and literal \\\\?\\ names are both refused', onWin, async () => {
   write('id_rsa', 'KEY');
   write('server.pem', 'CERT');
-  await refuses(path.join(R, 'id_rsa.'), /credential or key/);    // Win32 strips → id_rsa
-  await refuses(path.join(R, 'server.pem '), /credential or key/); // Win32 strips → server.pem
+  // Win32 would strip these to id_rsa / server.pem, but Node hands Windows
+  // \\?\-prefixed paths, so they name the literal (absent) files instead.
+  // Either way they must not upload.
+  await refuses(path.join(R, 'id_rsa.'), /credential or key|file not found/);
+  await refuses(path.join(R, 'server.pem '), /credential or key|file not found/);
   fs.mkdirSync(path.join(R, 'lit'), { recursive: true });
   for (const name of ['id_rsa.', 'server.pem ', 'deploy.key. .']) {
     const p = path.join(R, 'lit', name);
