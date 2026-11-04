@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { vetPath, resolveRoots, PathRefused } from '../src/safety.js';
 
 const WS = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-safety-'));
@@ -203,4 +204,225 @@ test('FINDING3: the vetted file cannot be swapped for outside content after vett
   assert.doesNotMatch(uploaded, /OUT-OF-ROOT SECRET/, 'post-vet swap changed the uploaded bytes (TOCTOU)');
   if (vetted.fh) await vetted.fh.close();
   fs.rmSync(outside, { recursive: true, force: true });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Swap races, deterministic. vetPath's test seam runs beforeOpen() between
+// the identity capture (lstat) and the open, exactly where a racing process
+// would swap the entry. On POSIX, O_NOFOLLOW or the identity check catches
+// it; on Windows (no O_NOFOLLOW) the identity check must do it alone.
+// ─────────────────────────────────────────────────────────────────────────
+const OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-out-'));
+process.on('exit', () => { try { fs.rmSync(OUT, { recursive: true, force: true }); } catch {} });
+const OUT_FILE = path.join(OUT, 'report.txt'); // benign name: only the root check stands in the way
+fs.writeFileSync(OUT_FILE, 'OUT-OF-ROOT CONTENT');
+
+async function refuses(p, needle, r = roots) {
+  await assert.rejects(() => vetPath(p, r), (e) => {
+    assert.ok(e instanceof PathRefused, `${p}: expected PathRefused, got ${e && e.stack || e}`);
+    if (needle) assert.match(e.message, needle, `${p}: ${e.message}`);
+    return true;
+  });
+}
+async function accepts(p, r = roots) {
+  const v = await vetPath(p, r);
+  await v.fh.close();
+  return v;
+}
+
+test('RACE: entry swapped for a symlink to an outside file after the lstat → refused', async () => {
+  const victim = write('race-symlink.bin', 'IN-ROOT');
+  await assert.rejects(() => vetPath(victim, roots, {
+    beforeOpen() { fs.rmSync(victim); fs.symlinkSync(OUT_FILE, victim, 'file'); },
+  }), (e) => {
+    assert.ok(e instanceof PathRefused, String(e));
+    assert.match(e.message, /changed while it was being checked|replaced by a symlink/);
+    return true;
+  });
+});
+
+test('RACE: entry replaced by a different regular file after the lstat → refused (identity mismatch)', async () => {
+  const victim = write('race-rename.bin', 'IN-ROOT');
+  const other = write('race-other.bin', 'SOMETHING ELSE');
+  await assert.rejects(() => vetPath(victim, roots, {
+    beforeOpen() { fs.renameSync(other, victim); },
+  }), (e) => {
+    assert.ok(e instanceof PathRefused, String(e));
+    assert.match(e.message, /changed while it was being checked/);
+    return true;
+  });
+});
+
+test('names Windows would rewrite are refused on every platform: trailing dot/space, ":" streams', async () => {
+  // Legal POSIX names; on Windows these spell a stream or a stripped name.
+  if (process.platform === 'win32') return; // created literally in the Windows block below
+  for (const name of ['server.pem ', 'id_rsa.', 'id_rsa. . ', 'secret.pem:hidden', 'prod.key::$DATA']) {
+    await refuses(write(name), /credential or key/);
+  }
+});
+
+test('vetted size is a Number (identity is compared as BigInt, size is handed back as Number)', async () => {
+  const v = await accepts(write('size-check.bin', 'abcd'));
+  assert.equal(typeof v.size, 'number');
+  assert.equal(v.size, 4);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Windows attack surface. Runs on the windows-latest CI runner (NTFS, admin).
+// ─────────────────────────────────────────────────────────────────────────
+const WIN = process.platform === 'win32';
+const onWin = { skip: !WIN && 'Windows only' };
+const R = roots[0];                          // the root as realpath spells it (long names)
+const lit = (p) => '\\\\?\\' + p;           // \\?\ — no Win32 normalisation, literal names
+const fsutil = (...args) => execFileSync('fsutil', args, { stdio: 'pipe' }).toString();
+
+test('WIN ADS: alternate data streams are refused, whatever the main file is called', onWin, async () => {
+  write('secret.pem', 'cert');
+  fs.writeFileSync(path.join(R, 'secret.pem:hidden'), 'HIDDEN');
+  write('notes.txt', 'plain notes');
+  fs.writeFileSync(path.join(R, 'notes.txt:payload'), 'SMUGGLED');
+  for (const s of ['secret.pem:hidden', 'notes.txt::$DATA', 'notes.txt:payload', 'notes.txt:payload:$DATA']) {
+    await refuses(path.join(R, s), /alternate data stream/);
+  }
+  await accepts(path.join(R, 'notes.txt')); // control: the main stream is fine
+});
+
+test('WIN 8.3: short names resolve to the long name before the name check', onWin, async (t) => {
+  const key = write('id_ed25519_backup', 'KEY');
+  fs.mkdirSync(path.join(R, '.ssh'), { recursive: true });
+  write('.ssh/notes.txt', 'n');
+  const plain = write('long_report_name.txt', 'ok');
+  try {
+    fsutil('file', 'setshortname', key, 'IDED~1');
+    fsutil('file', 'setshortname', path.join(R, '.ssh'), 'SSHDIR~1');
+    fsutil('file', 'setshortname', plain, 'LONGRE~1.TXT');
+  } catch (e) {
+    t.skip('fsutil setshortname failed on this volume: ' + (e.stderr || e.message));
+    return;
+  }
+  await refuses(path.join(R, 'IDED~1'), /credential or key/);
+  await refuses(path.join(R, 'SSHDIR~1', 'notes.txt'), /dot-directory/);
+  const v = await accepts(path.join(R, 'LONGRE~1.TXT'));
+  assert.equal(v.path, plain, 'short name resolved to the long one');
+});
+
+test('WIN trailing dots and spaces: stripped names and literal \\\\?\\ names are both refused', onWin, async () => {
+  write('id_rsa', 'KEY');
+  write('server.pem', 'CERT');
+  await refuses(path.join(R, 'id_rsa.'), /credential or key/);    // Win32 strips → id_rsa
+  await refuses(path.join(R, 'server.pem '), /credential or key/); // Win32 strips → server.pem
+  fs.mkdirSync(path.join(R, 'lit'), { recursive: true });
+  for (const name of ['id_rsa.', 'server.pem ', 'deploy.key. .']) {
+    const p = path.join(R, 'lit', name);
+    fs.writeFileSync(lit(p), 'LITERAL');
+    await refuses(lit(p), /credential or key|not found/);
+  }
+});
+
+test('WIN reserved device names: CON, NUL, COM1, with and without extensions, file or directory', onWin, async () => {
+  for (const name of ['CON', 'NUL', 'COM1', 'con.txt', 'NUL.tar.gz', 'com1.log', 'AUX ', 'lpt1 .txt', 'COM¹', 'CONIN$']) {
+    await refuses(path.join(R, name), /reserved Windows device name/);
+  }
+  await refuses(path.join(R, 'nul', 'x.txt'), /reserved Windows device name/);
+  fs.mkdirSync(path.join(R, 'lit'), { recursive: true });
+  const real = path.join(R, 'lit', 'con.txt');
+  fs.writeFileSync(lit(real), 'a real file with a device name');
+  await refuses(lit(real), /reserved Windows device name/);
+});
+
+test('WIN drive-letter case and mixed separators, in STICKAFILE_ALLOW and in the path', onWin, async () => {
+  const ok = write('case/ok.txt', 'ok');
+  const lowerRoot = R[0].toLowerCase() + R.slice(1);
+  for (const allow of [lowerRoot, lowerRoot.replace(/\\/g, '/'), R + '\\', R.replace(/\\/g, '/') + '/']) {
+    const r2 = await resolveRoots({ STICKAFILE_ALLOW: allow });
+    assert.deepEqual(r2, roots, 'STICKAFILE_ALLOW=' + allow);
+  }
+  for (const p of [
+    ok,
+    lowerRoot + '\\case\\ok.txt',
+    R.replace(/\\/g, '/') + '/case/ok.txt',
+    R + '/case\\ok.txt',
+    R.toUpperCase() + '\\CASE\\OK.TXT',
+  ]) {
+    const v = await accepts(p);
+    assert.equal(v.path, ok, p + ' → ' + v.path);
+  }
+  // A sibling whose name starts with the root's name is still outside.
+  const sib = R + '-evil';
+  fs.mkdirSync(sib, { recursive: true });
+  fs.writeFileSync(path.join(sib, 'x.txt'), 'x');
+  await refuses(path.join(sib, 'x.txt'), /outside the allowed workspace/);
+  await refuses(sib.toLowerCase().replace(/\\/g, '/') + '/x.txt', /outside the allowed workspace/);
+  fs.rmSync(sib, { recursive: true, force: true });
+  // Two roots with the Windows delimiter.
+  const two = await resolveRoots({ STICKAFILE_ALLOW: lowerRoot + ';' + OUT });
+  assert.equal(two.length, 2);
+});
+
+test('WIN UNC and \\\\?\\ long paths', onWin, async () => {
+  const ok = write('unc/ok.txt', 'ok');
+  // \\?\C:\... is the same file: accepted, reported in the plain spelling.
+  assert.equal((await accepts(lit(ok))).path, ok);
+  // \\?\ does not collapse "..": it must not climb out of the root.
+  await refuses(lit(R + '\\..\\' + path.basename(OUT) + '\\report.txt'));
+  // Device namespace and volume GUID paths are refused outright.
+  for (const p of ['\\\\.\\' + ok, '\\\\.\\PhysicalDrive0', '\\\\?\\GLOBALROOT\\Device\\Null', '\\\\.\\NUL', '//./' + ok.replace(/\\/g, '/')]) {
+    await refuses(p, /device path/);
+  }
+  // The admin share points at the same disk. Refused (outside the C:\ root)
+  // or accepted as the same in-root file — never anything outside the root.
+  const share = '\\\\localhost\\' + R[0] + '$' + R.slice(2);
+  for (const p of [share + '\\unc\\ok.txt', '\\\\?\\UNC\\localhost\\' + R[0] + '$' + R.slice(2) + '\\unc\\ok.txt']) {
+    try {
+      const v = await accepts(p);
+      assert.equal(v.path, ok, p + ' was accepted as ' + v.path);
+    } catch (e) {
+      assert.ok(e instanceof PathRefused, p + ': ' + e);
+    }
+  }
+  // An outside file through the share is refused.
+  const outShare = '\\\\localhost\\' + OUT_FILE[0] + '$' + OUT_FILE.slice(2);
+  try { await refuses(outShare); } catch (e) { throw new Error('admin share leaked an outside file: ' + e.message); }
+});
+
+test('WIN junctions and symlinks pointing outside the root are refused', onWin, async () => {
+  fs.symlinkSync(OUT, path.join(R, 'junc'), 'junction');
+  await refuses(path.join(R, 'junc', 'report.txt'), /outside the allowed workspace/);
+  fs.symlinkSync(OUT, path.join(R, 'dirlink'), 'dir');
+  await refuses(path.join(R, 'dirlink', 'report.txt'), /outside the allowed workspace/);
+  fs.symlinkSync(OUT_FILE, path.join(R, 'filelink.txt'), 'file');
+  await refuses(path.join(R, 'filelink.txt'), /outside the allowed workspace/);
+  // Relative symlink climbing out.
+  fs.symlinkSync('..\\' + path.basename(OUT) + '\\report.txt', path.join(R, 'rel-link.txt'), 'file');
+  await refuses(path.join(R, 'rel-link.txt'), /outside the allowed workspace/);
+  // Control: a junction to a directory inside the root is fine.
+  const inner = write('inner/f.txt', 'inner');
+  fs.symlinkSync(path.join(R, 'inner'), path.join(R, 'junc-in'), 'junction');
+  assert.equal((await accepts(path.join(R, 'junc-in', 'f.txt'))).path, inner);
+  // A junction into a dot-directory inside the root is still a dotfile.
+  write('.git/config.txt', 'x');
+  fs.symlinkSync(path.join(R, '.git'), path.join(R, 'gitjunc'), 'junction');
+  await refuses(path.join(R, 'gitjunc', 'config.txt'), /dot-directory/);
+});
+
+test('WIN hard links on NTFS are refused (nlink is populated)', onWin, async () => {
+  const out = path.join(OUT, 'hl-src.txt');
+  fs.writeFileSync(out, 'OUTSIDE');
+  fs.linkSync(out, path.join(R, 'hl-out.txt'));
+  await refuses(path.join(R, 'hl-out.txt'), /multiple hard links/);
+  const a = write('hl-a.txt', 'IN');
+  fs.linkSync(a, path.join(R, 'hl-b.txt'));
+  await refuses(a, /multiple hard links/);
+  assert.equal(fs.statSync(a).nlink, 2, 'nlink reported by stat');
+});
+
+test('WIN race: final component swapped for a junction/symlink between lstat and open → refused', onWin, async () => {
+  const victim = write('race-win.bin', 'IN-ROOT');
+  await assert.rejects(() => vetPath(victim, roots, {
+    beforeOpen() { fs.rmSync(victim); fs.symlinkSync(OUT_FILE, victim, 'file'); },
+  }), (e) => {
+    assert.ok(e instanceof PathRefused, String(e));
+    assert.match(e.message, /changed while it was being checked/, 'Windows has no O_NOFOLLOW: the identity check must catch it');
+    return true;
+  });
 });
