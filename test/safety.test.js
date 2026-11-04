@@ -191,7 +191,10 @@ test('FINDING3: the vetted file cannot be swapped for outside content after vett
 
   const vetted = await vetPath(victim, roots);
   // Attacker replaces the just-vetted entry with a symlink out of the root.
-  fs.rmSync(victim);
+  // Rename it aside rather than delete it: on Windows with Node 20, deleting
+  // a file that is still open leaves its name reserved until the handle
+  // closes, so the symlink could not take the name.
+  fs.renameSync(victim, victim + '.old');
   fs.symlinkSync(secret, victim);
 
   // What the uploader would actually send. Prefer a pinned fd if vetPath
